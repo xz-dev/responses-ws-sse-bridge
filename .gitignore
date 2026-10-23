@@ -4,3 +4,7 @@ responses-ws-sse-bridge
 # agent state / review artifacts — not source
 .pi/
 REVIEW*.md
+
+# Generated binaries and validation output
+bin/
+*.log
