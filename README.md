@@ -64,7 +64,7 @@ for the tested Sub2API passthrough and owner-gate incompatibilities.
 |---|---|---|
 | `UPSTREAM_URL` | *(required)* | Sub2API base URL, `http(s)`, no query/userinfo |
 | `LISTEN_ADDR` | `:8080` | Listen address |
-| `PORT` | `8080` | Port probed by the image's TCP `healthcheck` command. Set this to the port in `LISTEN_ADDR` when overriding the default. |
+| `PORT` | *(unset)* | Optional healthcheck-only override: probe `127.0.0.1:$PORT` instead of `LISTEN_ADDR`. Does not change the server listener. |
 | `MAX_SOCKETS` | `64` | Live WebSockets; overflow handshake → 503 |
 | `MAX_MESSAGE_BYTES` | `16777216` | Max incoming WS frame bytes |
 | `MAX_BODY_BYTES` | `16777216` | Per-event bound: max bytes of one upstream error body or one SSE event |
@@ -91,11 +91,26 @@ values. The POST body is an `io.MultiReader` of literal segments plus
 `SectionReader` spans over that spool — a known `Content-Length` with no
 second copy. Queued spools are released on every disconnect path.
 
+## Healthcheck
+
+The `healthcheck` command sends `GET /healthz` and succeeds only for HTTP 200,
+without following redirects. Its total timeout is 2 seconds; it does not use
+HTTP proxy environment variables. It uses the server's `LISTEN_ADDR` and the
+same `:8080` default, so `LISTEN_ADDR=127.0.0.1:8086` needs no separate port
+setting. An empty or wildcard host probes loopback (`127.0.0.1` for IPv4,
+`::1` for IPv6).
+
+An explicit `PORT` retains the old override contract: probe
+`127.0.0.1:$PORT`, regardless of `LISTEN_ADDR`. Keep overrides aligned with the
+bridge listener in shared network namespaces. This checks local HTTP liveness,
+not upstream health, inference, or cached continuation; `UPSTREAM_URL` is not
+required by the command.
+
 ## Published deployment and healthcheck caveat
 
 The AI-gateway deployment uses implementation `6af0a3ef95c6a6f1e1cd8fe353b974196fdc2d44`, image `ghcr.io/xz-dev/responses-ws-sse-bridge:6af0a3ef95c6a6f1e1cd8fe353b974196fdc2d44@sha256:3b23fd0963d415d32beefa783fc50d83d03342d3c95d2551554afbc5dd006caa`. Documentation commits after that revision do not imply a newer image has been deployed.
 
-**For this image use `LISTEN_ADDR=127.0.0.1:8086` together with `PORT=8086`.** Its healthcheck reads `PORT`, not `LISTEN_ADDR`, and checks a TCP listener, not HTTP readiness. In a shared network namespace, omitting `PORT` can falsely report another service on 8080 as healthy. On the 2026-10-23 cold boot this caused a dependency deadlock: keepalive was waiting for keeper, keeper for bridge health, while bridge incorrectly checked keepalive's port. A successful `/healthz` GET on the bridge's actual port is the independent application check. See the gateway decision/incident record for recovery status; this README does not claim a healthcheck-code fix or a reboot drill.
+**For this image use `LISTEN_ADDR=127.0.0.1:8086` together with `PORT=8086`.** Its healthcheck reads `PORT`, not `LISTEN_ADDR`, and checks a TCP listener, not HTTP readiness. In a shared network namespace, omitting `PORT` can falsely report another service on 8080 as healthy. On the 2026-10-23 cold boot this caused a dependency deadlock: keepalive was waiting for keeper, keeper for bridge health, while bridge incorrectly checked keepalive's port. A successful `/healthz` GET on the bridge's actual port is the independent application check. See the gateway decision/incident record for recovery status. The source-level healthcheck fix above has not been deployed as part of this change; no VM reboot drill has been performed.
 
 Before initial publication a binary/log cleanup was required. Current reachable history contains no generated binary (largest blob 22,001 bytes at implementation revision); an initial mistaken push was force-with-lease replaced, so GitHub may retain unreachable objects until GC. No credentials were embedded in the removed binary.
 
