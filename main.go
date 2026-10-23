@@ -42,11 +42,14 @@ type config struct {
 	spoolDir     string // dir for request spools; "" = os.TempDir()
 }
 
-func loadConfig() (config, error) {
-	listen := os.Getenv("LISTEN_ADDR")
-	if listen == "" {
-		listen = ":8080"
+func listenAddr() string {
+	if addr := os.Getenv("LISTEN_ADDR"); addr != "" {
+		return addr
 	}
+	return ":8080"
+}
+
+func loadConfig() (config, error) {
 	raw := os.Getenv("UPSTREAM_URL")
 	if raw == "" {
 		return config{}, errors.New("UPSTREAM_URL is required")
@@ -97,7 +100,7 @@ func loadConfig() (config, error) {
 		return config{}, fmt.Errorf("SPOOL_DIR %q is not a usable directory (set it or TMPDIR to a writable dir; the image ships /spool)", spoolDir)
 	}
 	return config{
-		listen: listen, upstream: u,
+		listen: listenAddr(), upstream: u,
 		maxSockets: sockets, maxMsgBytes: msg, maxBodyBytes: body,
 		workBytes: work,
 		turnIdle:  time.Duration(idle) * time.Second,
@@ -129,17 +132,46 @@ func envInt64(name string, def int64) (int64, error) {
 	return n, nil
 }
 
+func healthcheck() error {
+	addr := listenAddr()
+	if port := os.Getenv("PORT"); port != "" {
+		addr = net.JoinHostPort("127.0.0.1", port)
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("healthcheck address: %w", err)
+	}
+	switch host {
+	case "", "0.0.0.0":
+		host = "127.0.0.1"
+	case "::":
+		host = "::1"
+	}
+	client := &http.Client{
+		Timeout:   2 * time.Second,
+		Transport: &http.Transport{DisableKeepAlives: true},
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	target := url.URL{Scheme: "http", Host: net.JoinHostPort(host, port), Path: "/healthz"}
+	resp, err := client.Get(target.String())
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("healthcheck: %s", resp.Status)
+	}
+	return nil
+}
+
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
-		port := os.Getenv("PORT")
-		if port == "" {
-			port = "8080"
-		}
-		conn, err := net.DialTimeout("tcp", "127.0.0.1:"+port, 2*time.Second)
-		if err != nil {
+		if err := healthcheck(); err != nil {
+			log.Print(err)
 			os.Exit(1)
 		}
-		conn.Close()
 		os.Exit(0)
 	}
 
