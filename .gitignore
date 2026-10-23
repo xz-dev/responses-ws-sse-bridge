@@ -1,0 +1,6 @@
+responses-ws-sse-bridge
+*.pprof
+
+# agent state / review artifacts — not source
+.pi/
+REVIEW*.md
