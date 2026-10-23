@@ -36,9 +36,9 @@ type blockPeek struct {
 	count int
 
 	// per-line state
-	lineLen  int     // bytes consumed on the current line
-	isData   bool    // current line's field name is exactly "data"
-	sawColon bool    // a ':' appeared on the current line
+	lineLen  int  // bytes consumed on the current line
+	isData   bool // current line's field name is exactly "data"
+	sawColon bool // a ':' appeared on the current line
 
 	// per-block state
 	hasData   bool // current block contains ≥1 data field

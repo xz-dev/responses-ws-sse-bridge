@@ -468,7 +468,6 @@ func markConsumed(stack []frameState) {
 	stack[len(stack)-1].first = false
 }
 
-
 func (s *streamScan) lit(p int64, word string) (int64, error) {
 	for i, c := range []byte(word) {
 		b, ok, err := s.byteAt(p + int64(i))

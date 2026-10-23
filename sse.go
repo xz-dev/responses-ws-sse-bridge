@@ -22,9 +22,9 @@ import (
 // the timer. The header-wait stage passes an onFire that cancels the
 // request; the body stage uses fired() in relaySSE's select.
 type idleWatch struct {
-	t   *time.Timer
-	d   time.Duration
-	ch  chan struct{}
+	t    *time.Timer
+	d    time.Duration
+	ch   chan struct{}
 	once sync.Once
 }
 

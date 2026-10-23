@@ -483,17 +483,17 @@ func responseObject(id, model, status string, errObj any, completedAt float64) m
 		now = float64(time.Now().Unix())
 	}
 	return map[string]any{
-		"id":                 id,
-		"object":             "response",
-		"created_at":         now,
-		"status":             status,
-		"model":              model,
-		"output":             []any{},
+		"id":                  id,
+		"object":              "response",
+		"created_at":          now,
+		"status":              status,
+		"model":               model,
+		"output":              []any{},
 		"parallel_tool_calls": true,
-		"tool_choice":        "auto",
-		"tools":              []any{},
-		"error":              errObj,
-		"incomplete_details": nil,
+		"tool_choice":         "auto",
+		"tools":               []any{},
+		"error":               errObj,
+		"incomplete_details":  nil,
 		"usage": map[string]any{
 			"input_tokens":          0,
 			"input_tokens_details":  map[string]any{"cached_tokens": 0},
