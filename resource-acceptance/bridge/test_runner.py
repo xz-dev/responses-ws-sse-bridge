@@ -124,5 +124,17 @@ class WorkloadOracleTests(unittest.TestCase):
                 r.verify_tcp_cleanup(passed)
 
 
+class KernelCapabilities(unittest.TestCase):
+    def test_zero_kernel_sets_required(self):
+        names = ('CapInh', 'CapPrm', 'CapEff', 'CapBnd', 'CapAmb')
+        zero = '\n'.join(name + ':\t0000000000000000' for name in names)
+        self.assertEqual(set(r.verify_kernel_capabilities(zero).values()), {0})
+        for name in names:
+            with self.assertRaisesRegex(AssertionError, 'retains kernel capabilities'):
+                r.verify_kernel_capabilities(zero.replace(name + ':\t0000000000000000', name + ':\t0000000000000001'))
+        with self.assertRaisesRegex(AssertionError, 'fields missing'):
+            r.verify_kernel_capabilities('CapEff:\t0000000000000000')
+
+
 if __name__ == '__main__':
     unittest.main()

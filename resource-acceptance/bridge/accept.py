@@ -64,6 +64,15 @@ def verify_tcp_cleanup(passed):
     assert passed['proper_close_tested'] is False
 
 
+def verify_kernel_capabilities(status):
+    required = {'CapInh', 'CapPrm', 'CapEff', 'CapBnd', 'CapAmb'}
+    fields = dict(line.split(':', 1) for line in status.splitlines() if ':' in line)
+    assert required <= fields.keys(), 'kernel capability fields missing'
+    caps = {key: int(fields[key].strip(), 16) for key in required}
+    assert not any(caps.values()), 'application retains kernel capabilities'
+    return caps
+
+
 def execute(image, sha, approval_path):
     assert re.fullmatch(r'[0-9a-f]{40}', sha), 'expected full source SHA required'
     m = re.fullmatch(r'([^@\s]+):([0-9a-f]{40})@sha256:([0-9a-f]{64})', image)
@@ -189,7 +198,10 @@ def execute(image, sha, approval_path):
         assert cfg['NanoCpus'] == 500000000 or cfg['CpuQuota'] / cfg['CpuPeriod'] == .5
         assert initial['Config']['User'] == '65534:65534'
         assert any(x.split('=')[0] == 'no-new-privileges' for x in cfg['SecurityOpt'])
-        assert cfg.get('CapDrop') and 'ALL' in [x.upper() for x in cfg['CapDrop']]
+        # Podman expands ALL into capability names; prove the resulting kernel state.
+        assert cfg.get('CapDrop') and not cfg.get('CapAdd'), 'capability drop configuration missing'
+        receipt['kernel_capabilities'] = verify_kernel_capabilities(
+            cmd('unshare', 'cat', f"/proc/{initial['State']['Pid']}/status"))
         assert not cfg.get('PortBindings') and not any(initial['NetworkSettings'].get('Ports', {}).values())
         assert initial['Config']['Env'].count('GOMEMLIMIT=192MiB') == 1
         assert not cfg.get('Tmpfs'), 'service tmpfs not allowed for this proof'
