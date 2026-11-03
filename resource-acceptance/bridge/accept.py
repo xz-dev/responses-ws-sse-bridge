@@ -180,6 +180,7 @@ def execute(image, sha, approval_path):
             raise RuntimeError('health never ready')
         initial = inspect(app)
         cfg = initial['HostConfig']
+        (out / 'app-initial.json').write_text(json.dumps(initial, indent=2))
         assert initial['Image'] == engine_id
         receipt['identity']['containerImageID'] = initial['Image']
         assert initial['Config']['Labels']['org.opencontainers.image.revision'] == sha
@@ -273,8 +274,10 @@ def execute(image, sha, approval_path):
         receipt['status'] = 'WORKLOAD_PASSED_NOT_DEPLOYMENT_ACCEPTANCE'
         receipt['remaining_gate'] = 'Parent independently compares fresh deployment volume Statfs (including blocks/headroom), identity, exact CI, and this receipt before accepting.'
     except Exception as exc:
+        import traceback
         receipt['status'] = 'FAILED_CLOSED'
         receipt['error'] = str(exc)
+        receipt['error_traceback'] = traceback.format_exc()
     finally:
         if log:
             log.close()
