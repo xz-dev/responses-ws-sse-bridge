@@ -20,7 +20,7 @@ OBSERVE = r'''
 import json,os,stat,sys
 pid,root=sys.argv[1:]
 s=os.stat(root)
-assert stat.S_IMODE(s.st_mode)==0o700 and s.st_uid==65534
+assert stat.S_IMODE(s.st_mode)==0o700 and s.st_uid==65534, f'spool root mode={stat.S_IMODE(s.st_mode):o} uid={s.st_uid}'
 files=[]
 for name in os.listdir(root):
  p=root+'/'+name
@@ -175,7 +175,7 @@ def execute(image, sha, approval_path):
         common = ['--pull=never', '--label', label + run_id, '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges', '--user=65534:65534', '--pids-limit=64']
         cmd('run', '--detach', '--name', app, *common,
             '--network=none', '--memory=256m', '--memory-swap=256m', '--cpus=0.5', '--stop-timeout=10',
-            '--volume', volume + ':/spool:rw',
+            '--volume', volume + ':/spool:rw,nocopy',
             '-e', 'UPSTREAM_URL=http://127.0.0.1:9001', '-e', 'LISTEN_ADDR=127.0.0.1:8080',
             '-e', 'SPOOL_DIR=/spool', '-e', 'GOMEMLIMIT=192MiB',
             '-e', 'MAX_MESSAGE_BYTES=16777216', '-e', 'MAX_BODY_BYTES=16777216', '-e', 'WORK_MAX_BYTES=268435456', image)
