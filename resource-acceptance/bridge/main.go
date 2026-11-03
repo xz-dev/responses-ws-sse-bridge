@@ -86,7 +86,10 @@ func selftest() error {
 	if _, err := joinTCP(time.Now(), joined, joined); err != nil {
 		return err
 	}
-	event("selftest_passed", map[string]any{"synthetic_events": 3, "rejected_wrong_sequence": true, "rejected_wrong_bytes": true, "rejected_wrong_type": true, "rejected_early_terminal": true, "rejected_tcp_total_over_200ms": true, "common_tcp_deadline_tested": true, "actual_image_test": "NOTRUN"})
+	if err := selftestReceiveBuffer(); err != nil {
+		return err
+	}
+	event("selftest_passed", map[string]any{"receive_buffer_restore_tested": true, "synthetic_events": 3, "rejected_wrong_sequence": true, "rejected_wrong_bytes": true, "rejected_wrong_type": true, "rejected_early_terminal": true, "rejected_tcp_total_over_200ms": true, "common_tcp_deadline_tested": true, "actual_image_test": "NOTRUN"})
 	return nil
 }
 
@@ -103,6 +106,78 @@ type client struct {
 	joined      chan struct{}
 	mu          sync.Mutex
 	count, size int
+	readBuffer  int
+}
+
+func socketReadBuffer(c *net.TCPConn) (int, error) {
+	raw, err := c.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
+	var size int
+	var sockErr error
+	err = raw.Control(func(fd uintptr) {
+		size, sockErr = syscall.GetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF)
+	})
+	if err != nil {
+		return 0, err
+	}
+	return size, sockErr
+}
+
+func selftestReceiveBuffer() error {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
+	conn, err := net.DialTimeout("tcp", listener.Addr().String(), time.Second)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	tcp := conn.(*net.TCPConn)
+	original, err := socketReadBuffer(tcp)
+	if err != nil {
+		return err
+	}
+	c := &client{tcp: tcp, readBuffer: original, gate: make(chan struct{})}
+	if err = tcp.SetReadBuffer(16 << 10); err != nil {
+		return err
+	}
+	if err = c.resume(); err != nil {
+		return err
+	}
+	if restored, err := socketReadBuffer(tcp); err != nil || restored != original {
+		return fmt.Errorf("receive buffer restore: got=%d want=%d error=%v", restored, original, err)
+	}
+	select {
+	case <-c.gate:
+	default:
+		return errors.New("reader did not resume after buffer restore")
+	}
+	missing := &client{gate: make(chan struct{})}
+	if missing.resume() == nil {
+		return errors.New("resume accepted missing original buffer")
+	}
+	select {
+	case <-missing.gate:
+		return errors.New("failed restore opened reader gate")
+	default:
+	}
+	return nil
+}
+
+func (c *client) resume() error {
+	if c.readBuffer <= 0 {
+		return errors.New("original receive buffer missing")
+	}
+	// Linux reports twice the requested SO_RCVBUF; restore the pre-pause value.
+	if err := c.tcp.SetReadBuffer(c.readBuffer / 2); err != nil {
+		return err
+	}
+	close(c.gate)
+	return nil
 }
 
 func dial(ctx context.Context, paused bool) (*client, error) {
@@ -111,7 +186,12 @@ func dial(ctx context.Context, paused bool) (*client, error) {
 		n, e := (&net.Dialer{}).DialContext(ctx, network, address)
 		if e == nil {
 			c.tcp = n.(*net.TCPConn)
-			e = c.tcp.SetReadBuffer(16 << 10)
+			if paused {
+				c.readBuffer, e = socketReadBuffer(c.tcp)
+				if e == nil {
+					e = c.tcp.SetReadBuffer(16 << 10)
+				}
+			}
 		}
 		return n, e
 	}}
@@ -387,7 +467,9 @@ func run() error {
 		return e
 	}
 	event("blocked_hold_complete", map[string]any{"stable_seconds": 32, "source_sent": count, "source_total": chunks, "unrelated_B_completed": true})
-	close(slow.gate)
+	if e = slow.resume(); e != nil {
+		return e
+	}
 	if e = slow.wait(ctx); e != nil {
 		return e
 	}
