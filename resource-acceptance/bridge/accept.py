@@ -187,6 +187,8 @@ def execute(image, sha, approval_path):
             time.sleep(.2)
         else:
             raise RuntimeError('health never ready')
+        # First mount initializes volume metadata even with nocopy; prepare only our owned volume after engine initialization.
+        cmd('unshare', 'chmod', '0700', spool)
         initial = inspect(app)
         cfg = initial['HostConfig']
         (out / 'app-initial.json').write_text(json.dumps(initial, indent=2))
