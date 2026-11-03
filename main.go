@@ -34,11 +34,9 @@ import (
 type config struct {
 	listen       string
 	upstream     *url.URL
-	maxSockets   int
 	maxMsgBytes  int64
 	maxBodyBytes int64
 	workBytes    int64
-	turnIdle     time.Duration
 	spoolDir     string // dir for request spools; "" = os.TempDir()
 }
 
@@ -66,10 +64,6 @@ func loadConfig() (config, error) {
 	default:
 		return config{}, errors.New("UPSTREAM_URL scheme must be http or https")
 	}
-	sockets, err := envInt("MAX_SOCKETS", 64)
-	if err != nil {
-		return config{}, err
-	}
 	msg, err := envInt64("MAX_MESSAGE_BYTES", 16<<20)
 	if err != nil {
 		return config{}, err
@@ -78,19 +72,12 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
-	idle := 0
-	if v := os.Getenv("TURN_IDLE_TIMEOUT_SECONDS"); v != "" {
-		idle, err = envInt("TURN_IDLE_TIMEOUT_SECONDS", 0)
-		if err != nil {
-			return config{}, err
-		}
-	}
 	work, err := envInt64("WORK_MAX_BYTES", 256<<20)
 	if err != nil {
 		return config{}, err
 	}
-	if sockets <= 0 || msg <= 0 || body <= 0 || work <= 0 || idle < 0 {
-		return config{}, errors.New("limits must be positive; TURN_IDLE_TIMEOUT_SECONDS may be 0 (disabled)")
+	if msg <= 0 || body <= 0 || work <= 0 {
+		return config{}, errors.New("limits must be positive")
 	}
 	spoolDir := os.Getenv("SPOOL_DIR")
 	if spoolDir == "" {
@@ -101,23 +88,10 @@ func loadConfig() (config, error) {
 	}
 	return config{
 		listen: listenAddr(), upstream: u,
-		maxSockets: sockets, maxMsgBytes: msg, maxBodyBytes: body,
+		maxMsgBytes: msg, maxBodyBytes: body,
 		workBytes: work,
-		turnIdle:  time.Duration(idle) * time.Second,
 		spoolDir:  spoolDir,
 	}, nil
-}
-
-func envInt(name string, def int) (int, error) {
-	v := os.Getenv(name)
-	if v == "" {
-		return def, nil
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil {
-		return 0, fmt.Errorf("%s: %w", name, err)
-	}
-	return n, nil
 }
 
 func envInt64(name string, def int64) (int64, error) {

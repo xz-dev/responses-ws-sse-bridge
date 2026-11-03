@@ -81,7 +81,7 @@ func startPair(t *testing.T, upstream *sseUpstream, cfgOverride func(*config)) *
 	uURL, _ := url.Parse(uSrv.URL)
 	cfg := config{
 		upstream: uURL, listen: "127.0.0.1:0",
-		maxSockets: 8, maxMsgBytes: 1 << 20, maxBodyBytes: 1 << 20,
+		maxMsgBytes: 1 << 20, maxBodyBytes: 1 << 20,
 	}
 	if cfgOverride != nil {
 		cfgOverride(&cfg)
@@ -383,7 +383,10 @@ func TestClientCloseCancelsUpstream(t *testing.T) {
 // code reaches the client.
 func TestOversizeFrame(t *testing.T) {
 	up := newSSEUpstream(t)
-	p := startPair(t, up, func(c *config) { c.maxMsgBytes = 64 })
+	p := startPair(t, up, func(c *config) {
+		c.maxMsgBytes = 64
+		c.workBytes = 64 << 10 // Test frame-size rejection, not spool bookkeeping capacity.
+	})
 	defer p.close()
 	conn := dial(t, p, "/v1/responses", nil)
 	defer conn.CloseNow()
@@ -481,38 +484,33 @@ func TestUnsupportedFrameType(t *testing.T) {
 // RFC 6455 §7.1: the socket limit must reject the upgrade with an HTTP
 // status, not complete the handshake then close. Uses a real net.Listener —
 // httptest.Server's connection tracking can serialize the third client.
-func TestSocketLimit(t *testing.T) {
+func TestSessionByteCapacity(t *testing.T) {
 	up := newSSEUpstream(t)
-	release := make(chan struct{})
-	up.sse = func(w http.ResponseWriter, r *http.Request) { <-release }
-	p := startPair(t, up, func(c *config) { c.maxSockets = 2 })
+	p := startPair(t, up, func(c *config) { c.workBytes = sessionBaseBytes + 8<<10 })
 	defer p.close()
-	defer close(release)
-
-	var conns []*websocket.Conn
-	for i := 0; i < 2; i++ {
-		conns = append(conns, dial(t, p, "/v1/responses", nil))
-		writeFrame(t, conns[i], `{"type":"response.create","model":"m","input":"x"}`)
+	conn := dial(t, p, "/v1/responses", nil)
+	defer conn.CloseNow()
+	charged := p.bridge.work.Load()
+	if charged < sessionBaseBytes || charged > p.bridge.cfg.workBytes {
+		t.Fatalf("idle session not charged: %d", charged)
 	}
-	defer func() {
-		for _, c := range conns {
-			c.CloseNow()
-		}
-	}()
-	// Wait until both sockets are counted busy before the third dial.
-	deadline := time.Now().Add(2 * time.Second)
-	for len(p.bridge.sockets) < 2 && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	_, resp, err := websocket.Dial(ctx, wsURL(p.bSrv.URL)+"/v1/responses", nil)
+	other, resp, err := websocket.Dial(ctx, wsURL(p.bSrv.URL)+"/v1/responses", nil)
 	if err == nil {
-		t.Fatal("expected dial failure")
+		other.CloseNow()
+		t.Fatal("accepted session beyond real working-byte capacity")
 	}
-	if resp.StatusCode != 503 {
-		t.Fatalf("status %d", resp.StatusCode)
+	if resp == nil || resp.StatusCode != 503 {
+		t.Fatalf("capacity status: %v %v", resp, err)
+	}
+	_ = conn.CloseNow()
+	deadline := time.Now().Add(time.Second)
+	for p.bridge.work.Load() != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if p.bridge.work.Load() != 0 {
+		t.Fatalf("session lease leaked: %d", p.bridge.work.Load())
 	}
 }
 

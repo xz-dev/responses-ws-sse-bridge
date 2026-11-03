@@ -102,7 +102,7 @@ func runRelayBench(b *testing.B, sseBody string) {
 	uURL, _ := url.Parse(uSrv.URL)
 	br := newBridge(config{
 		upstream: uURL, listen: "127.0.0.1:0",
-		maxSockets: 8, maxMsgBytes: 1 << 20, maxBodyBytes: 64 << 20,
+		maxMsgBytes: 1 << 20, maxBodyBytes: 64 << 20,
 	})
 	bSrv := httptest.NewServer(br)
 	b.Cleanup(bSrv.Close)
@@ -142,7 +142,7 @@ func BenchmarkHTTPPassthrough(b *testing.B) {
 	uURL, _ := url.Parse(uSrv.URL)
 	br := newBridge(config{
 		upstream: uURL, listen: "127.0.0.1",
-		maxSockets: 8, maxMsgBytes: 1 << 20, maxBodyBytes: 64 << 20,
+		maxMsgBytes: 1 << 20, maxBodyBytes: 64 << 20,
 	})
 	bSrv := httptest.NewServer(br)
 	b.Cleanup(bSrv.Close)

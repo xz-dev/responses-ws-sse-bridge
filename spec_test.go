@@ -32,7 +32,7 @@ func startBridge(t *testing.T, upstream http.HandlerFunc, cfg func(*config)) (*w
 	uURL, _ := url.Parse(uSrv.URL)
 	c := config{
 		upstream: uURL, listen: "127.0.0.1:0",
-		maxSockets: 8, maxMsgBytes: 1 << 20, maxBodyBytes: 4 << 20,
+		maxMsgBytes: 1 << 20, maxBodyBytes: 4 << 20,
 	}
 	if cfg != nil {
 		cfg(&c)

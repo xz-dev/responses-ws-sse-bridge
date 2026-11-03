@@ -1,0 +1,178 @@
+name: publish-maintenance-transparent-lifecycle
+
+# One-shot publication of the transparent lifecycle maintenance slice.
+# Triggers only on the owned maintenance branch; no tag, release, PR or
+# default-branch publication path. The existing ci.yml is untouched.
+# Normal CI green (with the pre-existing opt-in MEMLOAD=1 skip for
+# TestMemLoad) is source liveness only; it is NOT acceptance of the
+# actual image under the production 256MiB/256MiB/GOMEMLIMIT=192MiB
+# envelope, which the operator verifies against the immutable digest
+# afterwards.
+
+on:
+  push:
+    branches:
+      - maintenance/transparent-lifecycle
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-maintenance-transparent-lifecycle-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/responses-ws-sse-bridge
+
+jobs:
+  tests:
+    name: Full test suite (unfiltered, race)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Verify source scope against baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          baseline="83bb9819a5afbda0dbf0c6c7af998d92de82adae"
+          if git cat-file -e "${baseline}^{commit}" 2>/dev/null; then
+            base_for_diff="$baseline"
+          else
+            git fetch --no-tags origin "${baseline}"
+            base_for_diff="FETCH_HEAD"
+          fi
+          changed=$(git diff --name-only "${base_for_diff}"..HEAD | sort)
+          expected=$(printf '%s\n' \
+            README.md \
+            bench_test.go \
+            bridge.go \
+            bridge_test.go \
+            controlled_write_red_test.go \
+            event_json.go \
+            event_spool.go \
+            http_error_spool.go \
+            main.go \
+            mem_test.go \
+            p2_error_test.go \
+            p2_lifetime_test.go \
+            p2_streaming_test.go \
+            reader_error_cancel_test.go \
+            regress_test.go \
+            request_body.go \
+            request_queue.go \
+            request_queue_test.go \
+            scan.go \
+            session_budget.go \
+            spec_test.go \
+            spool_store.go \
+            sse.go \
+            transparency_accounting_test.go \
+            transparent_admission_red_test.go \
+            .github/workflows/publish-maintenance-transparent-lifecycle.yml \
+            ops/scripts/ci/immutable-tag-guard.sh \
+            ops/scripts/ci/test-immutable-tag-guard.sh | sort)
+          test "$changed" = "$expected"
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gofmt
+        run: test -z "$(gofmt -l .)"
+      - name: go vet
+        run: go vet ./...
+      - name: Full test suite (unfiltered)
+        run: go test ./... -count=1 -v -timeout=300s
+      - name: Full test suite with race (unfiltered)
+        run: go test -race ./... -count=1 -v -timeout=600s
+      - name: Immutable-tag guard unit tests
+        run: bash ops/scripts/ci/test-immutable-tag-guard.sh
+
+  image:
+    name: Build and publish linux/amd64 image
+    runs-on: ubuntu-latest
+    needs: [tests]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Resolve immutable tag
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "tag=${IMAGE_NAME}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+      - name: Refuse to overwrite an existing tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash ops/scripts/ci/immutable-tag-guard.sh "${{ steps.image.outputs.tag }}"
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: ${{ steps.image.outputs.tag }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+      - name: Validate published digest
+        id: published
+        env:
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$BUILD_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "ref=${IMAGE_NAME}@${BUILD_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Published ${IMAGE_NAME}:${{ github.sha }}@${BUILD_DIGEST} from ${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
+      - name: Verify published image runtime contract
+        env:
+          PUBLISHED_REF: ${{ steps.published.outputs.ref }}
+          SOURCE_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="$PUBLISHED_REF"
+          docker pull "$ref"
+          test "$(docker image inspect "$ref" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$SOURCE_SHA"
+          test "$(docker image inspect "$ref" --format '{{json .Config.User}}')" = '"65534:65534"'
+          test "$(docker image inspect "$ref" --format '{{json .Config.Entrypoint}}')" = '["/responses-ws-sse-bridge"]'
+          # Liveness smoke only, under the production envelope shape
+          # (256MiB RAM, 256MiB total RAM+swap, GOMEMLIMIT=192MiB).
+          # This is not the operator's full resource acceptance of the image.
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --memory 256m --memory-swap 256m \
+            --tmpfs /spool:rw,size=32m,mode=0700,uid=65534,gid=65534 \
+            -e UPSTREAM_URL=http://127.0.0.1:9 \
+            -e LISTEN_ADDR=127.0.0.1:8080 \
+            -e GOMEMLIMIT=192MiB \
+            --name bridge-transparent-smoke \
+            -d "$ref"
+          trap 'docker logs bridge-transparent-smoke; docker rm -f bridge-transparent-smoke' EXIT
+          for attempt in $(seq 1 30); do
+            if docker exec bridge-transparent-smoke /responses-ws-sse-bridge healthcheck; then exit 0; fi
+            sleep 2
+          done
+          exit 1

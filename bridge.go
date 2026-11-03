@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -31,7 +30,6 @@ type bridge struct {
 	cfg          config
 	client       *http.Client
 	proxy        *httputil.ReverseProxy
-	sockets      chan struct{}
 	work         atomic.Int64 // bytes of resident frames currently charged
 	upstreamBase string
 }
@@ -55,7 +53,6 @@ func newBridge(cfg config) *bridge {
 			// own status, never re-route the POST.
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
-		sockets:      make(chan struct{}, cfg.maxSockets),
 		upstreamBase: strings.TrimSuffix(cfg.upstream.String(), "/"),
 		proxy: &httputil.ReverseProxy{
 			Rewrite: func(pr *httputil.ProxyRequest) {
@@ -117,10 +114,9 @@ type apiError struct {
 func (e *apiError) Error() string { return e.Message }
 
 var (
-	errSocketLimit  = &apiError{Status: http.StatusServiceUnavailable, Type: "server_error", Code: "working_set_unavailable", Message: "Working capacity unavailable; retry later."}
-	errTurnQueued   = &apiError{Status: http.StatusServiceUnavailable, Type: "server_error", Code: "working_set_unavailable", Message: "A turn is already in progress on this connection and the queue is full."}
-	errTooLarge     = &apiError{Status: http.StatusRequestEntityTooLarge, Type: "invalid_request_error", Code: "working_set_too_large", Message: "Request exceeds the configured size limit."}
-	errPrevNotFound = &apiError{Status: http.StatusBadRequest, Type: "invalid_request_error", Code: "previous_response_not_found", Param: "previous_response_id", Message: "The provided previous_response_id is not available for this user."}
+	errWorkingCapacity = &apiError{Status: http.StatusServiceUnavailable, Type: "server_error", Code: "working_set_unavailable", Message: "Working capacity unavailable; retry later."}
+	errTooLarge        = &apiError{Status: http.StatusRequestEntityTooLarge, Type: "invalid_request_error", Code: "working_set_too_large", Message: "Request exceeds the configured size limit."}
+	errPrevNotFound    = &apiError{Status: http.StatusBadRequest, Type: "invalid_request_error", Code: "previous_response_not_found", Param: "previous_response_id", Message: "The provided previous_response_id is not available for this user."}
 )
 
 func writeAPIError(w http.ResponseWriter, e *apiError) {
@@ -146,13 +142,12 @@ func writeJSONError(w http.ResponseWriter, status int, typ, code, msg string) {
 // conn.Reader — the only path that observes a client close or TCP drop and
 // answers pings.
 func (b *bridge) serveWS(w http.ResponseWriter, r *http.Request) {
-	select {
-	case b.sockets <- struct{}{}:
-	default:
-		writeAPIError(w, errSocketLimit)
+	sessionRelease := b.acquire(sessionWorkingBytes(r))
+	if sessionRelease == nil {
+		writeAPIError(w, errWorkingCapacity)
 		return
 	}
-	defer func() { <-b.sockets }()
+	defer sessionRelease()
 
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		OriginPatterns:  []string{"*"},
@@ -175,70 +170,53 @@ func (b *bridge) serveWS(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	var socketOnce sync.Once
-	dead := func() { socketOnce.Do(cancel) }
+	dead := func() { socketOnce.Do(func() { cancel(); _ = conn.CloseNow() }) }
 	defer dead()
 
-	// Goroutine 1 of 2 — the reader. It stays inside conn.Reader so control
-	// frames are always serviced (pings are answered even mid-message). Each
-	// message is spooled to a bounded temp file while UTF-8 is checked; only
-	// the file handle is handed to the worker, so the next conn.Reader call
-	// happens immediately and the worker never touches conn state. On queue
-	// overflow the reader drains the rejected message and answers it with an
-	// explicit overload error — one terminal reply per request, never
-	// coalesced.
-	type wsMsg = wsMsgLite
-	incoming := make(chan wsMsg, 1) // one frame may queue behind the in-flight turn
+	// The reader never writes application frames or waits for queue slots.
+	// Each closed spool owns its hard-byte lease until the worker finishes.
+	incoming := newRequestFIFO()
+	readerDone := make(chan struct{})
 	go func() {
-		defer close(incoming)
+		defer close(readerDone)
 		defer dead()
 		for {
-			// Background ctx: the library force-closes the conn when a read
-			// context ends; teardown is done by dead()/CloseNow.
 			typ, reader, err := conn.Reader(context.Background())
 			if err != nil {
 				return
 			}
 			msg := b.spoolFrame(reader)
 			msg.typ = typ
-			select {
-			case incoming <- msg:
-			case <-ctx.Done():
+			if msg.err != nil {
+				// Preserve RFC 6455 size rejection; this is a protocol close,
+				// never an application/error-frame write by the reader.
+				if errors.Is(msg.err, errTooLarge) {
+					_ = conn.Close(websocket.StatusMessageTooBig, "message too big")
+				}
+				// Real resource/IO failure cannot wait behind a blocked writer.
 				msg.release()
 				return
-			default:
+			}
+			if !incoming.push(&msg) {
 				msg.release()
-				b.sendErrorFrame(ctx, conn, errTurnQueued)
+				return
 			}
 		}
 	}()
-
-	// Worker exit: cancel the reader so it cannot enqueue again, then drain
-	// and release every queued spool. cancel() both unblocks the reader's
-	// <-ctx.Done() arm and fails conn.Reader; CloseNow() makes that prompt.
 	defer func() {
-		cancel()
-		conn.CloseNow()
-		for msg := range incoming {
-			msg.release()
-		}
+		dead()
+		incoming.close()
+		<-readerDone
 	}()
 
-	// Goroutine 2 of 2 — this turn worker.
+	// Only this worker emits application frames, in FIFO order.
 	for {
-		var msg wsMsg
-		var have bool
-		select {
-		case <-ctx.Done():
+		msg, have := incoming.pop(ctx)
+		if !have {
 			return
-		case msg, have = <-incoming:
-			if !have {
-				conn.Close(websocket.StatusNormalClosure, "bye")
-				return
-			}
 		}
 
 		turnCtx, stopTurn := context.WithCancel(ctx)
-
 		if msg.typ != websocket.MessageText {
 			msg.release()
 			b.sendErrorFrame(ctx, conn, &apiError{Status: http.StatusBadRequest, Type: "invalid_request_error", Message: "unsupported WebSocket frame type; send text frames containing response.create events"})
@@ -247,26 +225,29 @@ func (b *bridge) serveWS(w http.ResponseWriter, r *http.Request) {
 		}
 		if msg.badUTF {
 			msg.release()
-			// RFC 6455 §8.1/§7.4.1: invalid UTF-8 in a text message fails the
-			// connection with 1007.
 			stopTurn()
 			conn.Close(websocket.StatusInvalidFramePayloadData, "invalid utf-8")
 			return
 		}
-
-		if err := b.handleTurnStream(turnCtx, conn, msg.spool, msg.size, headers, path); err != nil {
-			stopTurn()
+		spool, err := os.Open(msg.name)
+		if err == nil {
+			err = b.handleTurnStream(turnCtx, conn, spool, msg.size, headers, path)
+			_ = spool.Close()
+		}
+		msg.release()
+		stopTurn()
+		if err != nil {
+			if errors.Is(err, errWorkBudget) {
+				return
+			}
 			conn.Close(websocket.StatusInternalError, "turn failed")
 			return
 		}
-		stopTurn()
 	}
 }
 
 func sendText(ctx context.Context, conn *websocket.Conn, data []byte) error {
-	wctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	return conn.Write(wctx, websocket.MessageText, data)
+	return conn.Write(ctx, websocket.MessageText, data)
 }
 
 func (b *bridge) sendErrorFrame(ctx context.Context, conn *websocket.Conn, e *apiError) {
@@ -292,57 +273,110 @@ func (b *bridge) sendErrorFrame(ctx context.Context, conn *websocket.Conn, e *ap
 
 // acquire reserves n bytes of the global working budget; all-or-nothing.
 // Returns a release func, or nil when the budget is full.
-func (b *bridge) acquire(n int64) func() {
+func (b *bridge) reserve(n int64) bool {
 	for {
 		cur := b.work.Load()
-		if cur+n > b.cfg.workBytes {
-			return nil
+		if n < 0 || n > b.cfg.workBytes-cur {
+			return false
 		}
 		if b.work.CompareAndSwap(cur, cur+n) {
-			return func() { b.work.Add(-n) }
+			return true
 		}
 	}
 }
 
-// release frees the queued message's spool exactly once.
+func (b *bridge) acquire(n int64) func() {
+	if !b.reserve(n) {
+		return nil
+	}
+	return func() { b.work.Add(-n) }
+}
+
+// release keeps file bytes charged until its descriptor is closed and its
+// pathname removed. An unlink failure retains the lease rather than lying
+// about freed disk capacity.
 func (m *wsMsgLite) release() {
-	if m.spool != nil {
-		m.spool.Close()
-		os.Remove(m.spool.Name())
-		m.spool = nil
+	if m.name != "" {
+		if err := os.Remove(m.name); err != nil && !os.IsNotExist(err) {
+			log.Printf("request spool cleanup failed: %v", err)
+			return
+		}
+		m.name = ""
+	}
+	if m.lease != nil {
+		m.lease.release()
 	}
 }
 
-// spoolFrame copies one message to a bounded temp file while checking
-// UTF-8. Called by the reader goroutine; returns the file (caller removes).
+// spoolFrame charges fixed read storage before allocating it and allocated
+// file blocks before writing. Admission is nonblocking: no lease waits for
+// more capacity while retaining prior spool data.
 func (b *bridge) spoolFrame(frame io.Reader) (m wsMsgLite) {
-	spool, err := os.CreateTemp(b.cfg.spoolDir, "bridge-turn-*.json")
+	readBytes := int64(requestReadBytes)
+	if b.cfg.maxMsgBytes+1 < readBytes {
+		readBytes = b.cfg.maxMsgBytes + 1
+	}
+	release := b.acquire(readBytes)
+	if release == nil {
+		return wsMsgLite{err: errWorkBudget}
+	}
+	defer release()
+	spool, err := b.newChargedSpool("bridge-turn-*.json")
 	if err != nil {
-		_, _ = io.Copy(io.Discard, frame)
-		return wsMsgLite{}
+		return wsMsgLite{err: err}
 	}
-	uv := &utf8Validator{}
-	size, err := io.Copy(spool, io.TeeReader(io.LimitReader(frame, b.cfg.maxMsgBytes+1), uv))
-	if err != nil || size > b.cfg.maxMsgBytes {
-		_, _ = io.Copy(io.Discard, frame)
+	defer func() {
+		if err := spool.close(); m.err == nil && err != nil {
+			m.err = err
+		}
+		if m.err != nil {
+			spool.release()
+		}
+	}()
+	buf := make([]byte, int(readBytes))
+	var uv utf8Validator
+	for {
+		limit := b.cfg.maxMsgBytes + 1 - spool.msg.size
+		if limit <= 0 {
+			m.err = errTooLarge
+			return
+		}
+		if limit > int64(len(buf)) {
+			limit = int64(len(buf))
+		}
+		n, rerr := frame.Read(buf[:limit])
+		if n > 0 {
+			if spool.msg.size+int64(n) > b.cfg.maxMsgBytes {
+				m.err = errTooLarge
+				return
+			}
+			_, _ = uv.Write(buf[:n])
+			if _, err := spool.Write(buf[:n]); err != nil {
+				m.err = err
+				return
+			}
+		}
+		if rerr != nil {
+			m = spool.msg
+			if rerr != io.EOF {
+				m.err = rerr
+			}
+			m.badUTF = !uv.valid()
+			return
+		}
 	}
-	if err == nil {
-		_, err = spool.Seek(0, io.SeekStart)
-	}
-	if err != nil {
-		spool.Close()
-		os.Remove(spool.Name())
-		return wsMsgLite{badUTF: false, size: -1}
-	}
-	return wsMsgLite{spool: spool, size: size, badUTF: !uv.valid()}
 }
 
-// wsMsgLite is the reader→worker handoff: a spooled frame plus validity.
+// wsMsgLite is the reader→worker handoff. Closed files avoid a file
+// descriptor per queued create; the worker reopens only its active spool.
 type wsMsgLite struct {
 	typ    websocket.MessageType
-	spool  *os.File
+	name   string
 	size   int64
 	badUTF bool
+	err    error
+	lease  *requestLease
+	next   *wsMsgLite
 }
 
 // handleTurnStream validates the spooled frame's JSON in one streaming
@@ -350,36 +384,30 @@ type wsMsgLite struct {
 // streams the rewrite to the upstream POST. The frame is never held in
 // RAM: validation reads it once from disk, and the POST body is an
 // io.MultiReader of "key": literals plus SectionReader value spans — a
-// known Content-Length with no second copy. The working budget admits the
-// turn before validation, on the spool's nominal size.
+// turn's reader-owned spool lease remains charged through validation and POST.
 func (b *bridge) handleTurnStream(ctx context.Context, conn *websocket.Conn, spool *os.File, size int64, headers http.Header, path string) error {
 	if spool == nil {
 		b.sendErrorFrame(ctx, conn, &apiError{Status: http.StatusBadRequest, Type: "invalid_request_error", Message: "could not read frame"})
 		return nil
 	}
-	defer func() {
-		spool.Close()
-		os.Remove(spool.Name())
-	}()
 	if size > b.cfg.maxMsgBytes {
 		b.sendErrorFrame(ctx, conn, errTooLarge)
 		return nil
 	}
 
-	// Admit the turn against the global working budget before any
-	// allocation on its behalf, using the spool's bounded nominal size.
-	release := b.acquire(size)
-	if release == nil {
-		b.sendErrorFrame(ctx, conn, errTooLarge)
-		return nil
-	}
-	defer release()
-
 	// Streaming validation + routing fields + member spans, one pass.
 	if _, err := spool.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("turn spool: %w", err)
 	}
-	info, err := inspectFrameStream(spool)
+	parseLease := &requestLease{bridge: b}
+	if !parseLease.grow(scanWorkingBytes(size)) {
+		return errWorkBudget
+	}
+	defer parseLease.release()
+	info, err := inspectFrameStream(spool, parseLease)
+	if errors.Is(err, errWorkBudget) {
+		return err
+	}
 	if err != nil {
 		msg := "invalid JSON in WebSocket frame"
 		if errors.Is(err, errTooDeep) {
@@ -389,6 +417,11 @@ func (b *bridge) handleTurnStream(ctx context.Context, conn *websocket.Conn, spo
 		return nil
 	}
 	if !info.isCreate {
+		release := b.acquire(32*int64(len(info.typeVal)) + 8192)
+		if release == nil {
+			return errWorkBudget
+		}
+		defer release()
 		quoted, _ := json.Marshal(info.typeVal)
 		b.sendErrorFrame(ctx, conn, &apiError{Status: http.StatusBadRequest, Type: "invalid_request_error", Message: fmt.Sprintf("unsupported frame type %s; expected response.create", quoted)})
 		return nil
@@ -398,6 +431,11 @@ func (b *bridge) handleTurnStream(ctx context.Context, conn *websocket.Conn, spo
 		return nil
 	}
 	if info.genFalse {
+		release := b.acquire(32*int64(len(info.model)) + 8192)
+		if release == nil {
+			return errWorkBudget
+		}
+		defer release()
 		id := "resp_" + randomHex(24)
 		for _, ev := range prewarmEvents(id, info.model) {
 			if err := sendText(ctx, conn, ev); err != nil {
@@ -409,6 +447,11 @@ func (b *bridge) handleTurnStream(ctx context.Context, conn *websocket.Conn, spo
 
 	// The POST body is a MultiReader of literal segments plus spool spans:
 	// Content-Length is known, nothing is copied into RAM.
+	for _, member := range info.members {
+		if !parseLease.grow(512 + 24*int64(len(member.key))) {
+			return errWorkBudget
+		}
+	}
 	body, bodyLen := rewrittenBody(spool, info)
 	return b.runUpstream(ctx, conn, body, bodyLen, headers, path)
 }
@@ -423,36 +466,39 @@ type utf8Validator struct {
 }
 
 func (v *utf8Validator) Write(p []byte) (int, error) {
+	n := len(p)
 	if v.bad {
-		return len(p), nil // already invalid: drain, accumulate nothing
+		return n, nil
 	}
-	// Prepend any partial rune from the previous chunk.
-	data := p
 	if v.tn > 0 {
-		buf := make([]byte, 0, v.tn+len(p))
-		buf = append(buf, v.tail[:v.tn]...)
-		data = append(buf, p...)
+		for !utf8.FullRune(v.tail[:v.tn]) && len(p) > 0 && v.tn < utf8.UTFMax {
+			v.tail[v.tn] = p[0]
+			v.tn++
+			p = p[1:]
+		}
+		if !utf8.FullRune(v.tail[:v.tn]) {
+			return n, nil
+		}
+		_, size := utf8.DecodeRune(v.tail[:v.tn])
+		if size == 1 {
+			v.bad = true
+			return n, nil
+		}
+		v.tn = 0
 	}
-	i := 0
-	for i < len(data) {
-		r, sz := utf8.DecodeRune(data[i:])
-		if r == utf8.RuneError && sz <= 1 {
-			if !utf8.FullRune(data[i:]) {
-				// incomplete trailing sequence: keep at most UTFMax bytes
-				if n := len(data) - i; n <= utf8.UTFMax {
-					copy(v.tail[:], data[i:])
-					v.tn = n
-					return len(p), nil
-				}
+	for len(p) > 0 {
+		_, size := utf8.DecodeRune(p)
+		if size == 1 && p[0] >= utf8.RuneSelf {
+			if !utf8.FullRune(p) {
+				v.tn = copy(v.tail[:], p)
+				return n, nil
 			}
 			v.bad = true
-			v.tn = 0
-			return len(p), nil
+			return n, nil
 		}
-		i += sz
+		p = p[size:]
 	}
-	v.tn = 0
-	return len(p), nil
+	return n, nil
 }
 
 func (v *utf8Validator) valid() bool {
@@ -529,16 +575,20 @@ func prewarmEvents(id, model string) [][]byte {
 
 // runUpstream POSTs the frame body to the upstream — the body is an
 // io.Reader of member spans with a known Content-Length — and relays each
-// complete SSE event's payload as one WS text frame.
-//
-// The idle timeout bounds upstream inactivity: it starts when the request
-// is issued (covering the wait for response headers) and resets on every
-// byte the body reader yields, including comment/heartbeat lines that the
-// SSE parser does not surface as events.
+// complete SSE event's payload as one WS text frame. Only the actual request
+// context and transport termination govern its established lifetime.
 func (b *bridge) runUpstream(ctx context.Context, conn *websocket.Conn, body io.Reader, bodyLen int64, headers http.Header, path string) error {
 	u := b.upstreamBase + path
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, body)
+	reqCtx, cancelReq := context.WithCancel(ctx)
+	defer cancelReq()
+	releaseUpload := b.acquire(httpUploadWindowBytes)
+	if releaseUpload == nil {
+		return errWorkBudget
+	}
+	owned := &ownedRequestBody{Reader: body, done: make(chan struct{}), releaseUpload: releaseUpload}
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, u, owned)
 	if err != nil {
+		_ = owned.Close()
 		return err
 	}
 	req.Header = headers.Clone()
@@ -546,44 +596,8 @@ func (b *bridge) runUpstream(ctx context.Context, conn *websocket.Conn, body io.
 	req.Header.Del("Accept-Encoding")
 	req.ContentLength = bodyLen
 
-	// Run client.Do in a goroutine so the idle timer bounds the header wait
-	// too. The timer cancels the request context on fire, unblocking Do.
-	var iw *idleWatch
-	if b.cfg.turnIdle > 0 {
-		iw = newIdleWatch(b.cfg.turnIdle, nil)
-		defer iw.stop()
-	}
-	type doRes struct {
-		resp *http.Response
-		err  error
-	}
-	doCh := make(chan doRes, 1)
-	reqCtx, cancelReq := context.WithCancel(ctx)
-	defer cancelReq()
-	req = req.WithContext(reqCtx)
-	go func() {
-		resp, err := b.client.Do(req)
-		doCh <- doRes{resp, err}
-	}()
-
-	var resp *http.Response
-	if iw != nil {
-		select {
-		case r := <-doCh:
-			resp, err = r.resp, r.err
-		case <-iw.fired():
-			cancelReq()
-			b.sendErrorFrame(ctx, conn, &apiError{Status: http.StatusGatewayTimeout, Type: "upstream_error", Message: "upstream produced no data within the idle timeout"})
-			return nil
-		case <-ctx.Done():
-			cancelReq()
-			return ctx.Err()
-		}
-		iw.stop() // headers received; body stage re-arms its own watch
-	} else {
-		r := <-doCh
-		resp, err = r.resp, r.err
-	}
+	resp, err := b.client.Do(req)
+	defer func() { cancelReq(); <-owned.done }()
 	if err != nil {
 		if ctx.Err() != nil {
 			return err
@@ -594,80 +608,8 @@ func (b *bridge) runUpstream(ctx context.Context, conn *websocket.Conn, body io.
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		limit := b.cfg.maxBodyBytes
-		ebody, rerr := io.ReadAll(io.LimitReader(resp.Body, limit+1))
-		if rerr != nil || int64(len(ebody)) > limit {
-			b.sendErrorFrame(ctx, conn, errTooLarge)
-			return nil
-		}
-		b.sendUpstreamError(ctx, conn, resp.StatusCode, ebody)
-		return nil
+		return b.relayHTTPError(ctx, conn, resp)
 	}
 
-	// Feed the body through a pipe that signals the idle watch on every
-	// read, so comments and partial-event bytes reset the timer.
-	var bodyReader io.Reader = resp.Body
-	var bw *idleWatch
-	if b.cfg.turnIdle > 0 {
-		bw = newIdleWatch(b.cfg.turnIdle, nil)
-		defer bw.stop()
-		pr, pw := io.Pipe()
-		go func() {
-			buf := make([]byte, 32<<10)
-			for {
-				n, rerr := resp.Body.Read(buf)
-				if n > 0 {
-					bw.activity()
-					if _, werr := pw.Write(buf[:n]); werr != nil {
-						return
-					}
-				}
-				if rerr != nil {
-					pw.CloseWithError(rerr)
-					return
-				}
-			}
-		}()
-		bodyReader = pr
-		defer pr.Close()
-	}
-
-	return relaySSE(ctx, conn, bodyReader, b.cfg.maxBodyBytes, bw, b.sendErrorFrame)
+	return b.relaySpooledSSE(ctx, conn, resp.Body)
 }
-
-// sendUpstreamError forwards a non-2xx upstream reply as an error frame that
-// carries the status and the upstream error object verbatim when it parses.
-func (b *bridge) sendUpstreamError(ctx context.Context, conn *websocket.Conn, status int, body []byte) {
-	var errVal any
-	if raw := findTopLevelMember(body, "error"); len(raw) > 0 {
-		if err := json.Unmarshal(raw, &errVal); err != nil {
-			errVal = nil
-		}
-	}
-	if errVal == nil {
-		msg := string(bytes.TrimSpace(body))
-		if len(msg) > 400 {
-			msg = msg[:400]
-		}
-		errVal = map[string]any{"type": "upstream_error", "message": msg}
-	}
-	frame, _ := json.Marshal(map[string]any{
-		"type": "error", "status": status, "error": errVal,
-	})
-	if err := sendText(ctx, conn, frame); err != nil {
-		log.Printf("ws write upstream error: %v", err)
-	}
-}
-
-// findTopLevelMember returns the raw value bytes of a top-level object
-// member, decoding only the small error body. The error body is bounded by
-// maxBodyBytes, so a plain Unmarshal is fine here.
-func findTopLevelMember(b []byte, name string) []byte {
-	var obj map[string]json.RawMessage
-	if json.Unmarshal(b, &obj) != nil {
-		return nil
-	}
-	return obj[name]
-}
-
-var _ = errors.Is

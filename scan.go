@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
 	"strings"
 )
 
@@ -57,11 +58,15 @@ type memberSpan struct {
 const maxToken = 4 << 20
 
 type streamScan struct {
-	r   io.Reader
-	buf []byte // sliding window of unprocessed input
-	off int64  // absolute offset of buf[0]
-	eof bool
-	err error
+	r          io.Reader
+	buf        []byte // sliding window of unprocessed input
+	off        int64  // absolute offset of buf[0]
+	eof        bool
+	err        error
+	depthLimit int // zero preserves the request scanner's existing limit
+	lease      *requestLease
+	readChunk  []byte // optional fixed scratch for event scanning
+	window     int64  // optional event compaction threshold
 }
 
 func newStreamScan(r io.Reader) *streamScan {
@@ -75,7 +80,10 @@ func (s *streamScan) abs(i int) int64 { return s.off + int64(i) }
 // Compaction of the consumed prefix is done separately via compact().
 func (s *streamScan) fill(need int) error {
 	for len(s.buf) < need && !s.eof {
-		chunk := make([]byte, 64<<10)
+		chunk := s.readChunk
+		if chunk == nil {
+			chunk = make([]byte, 64<<10)
+		}
 		n, err := s.r.Read(chunk)
 		s.buf = append(s.buf, chunk[:n]...)
 		if err == io.EOF {
@@ -119,8 +127,12 @@ func (s *streamScan) byteAt(p int64) (byte, bool, error) {
 	// Bound the window: once it exceeds ~4 chunk sizes past the read point,
 	// drop consumed bytes. A rewind to < s.off is only legal for callers
 	// that never passed the point — none do.
-	if i >= 256<<10 {
-		s.compact(p - (64 << 10))
+	window, keep := int64(256<<10), int64(64<<10)
+	if s.window > 0 {
+		window, keep = s.window, s.window/4
+	}
+	if int64(i) >= window {
+		s.compact(p - keep)
 		i = int(p - s.off)
 	}
 	return s.buf[i], true, nil
@@ -155,6 +167,20 @@ func (s *streamScan) scanStringSpan(p int64, decode bool) (end int64, decoded st
 		return p, "", errMalformed
 	}
 	var sb strings.Builder
+	ensure := func(extra int) error {
+		if !decode || s.lease == nil || sb.Len()+extra <= sb.Cap() {
+			return nil
+		}
+		n := int64(64)
+		for n < int64(2*sb.Cap()+extra+64) {
+			n *= 2
+		}
+		if !s.lease.grow(n) {
+			return errWorkBudget
+		}
+		sb.Grow(extra)
+		return nil
+	}
 	i := p + 1
 	for {
 		c, ok, err := s.byteAt(i)
@@ -178,6 +204,9 @@ func (s *streamScan) scanStringSpan(p int64, decode bool) (end int64, decoded st
 			switch c2 {
 			case '"', '\\', '/', 'b', 'f', 'n', 'r', 't':
 				if decode {
+					if e := ensure(1); e != nil {
+						return p, "", e
+					}
 					sb.WriteByte(unescapeByte(c2))
 				}
 				i += 2
@@ -191,6 +220,9 @@ func (s *streamScan) scanStringSpan(p int64, decode bool) (end int64, decoded st
 					hex[k] = h
 				}
 				if decode {
+					if e := ensure(4); e != nil {
+						return p, "", e
+					}
 					sb.WriteRune(rune(hexVal(hex)))
 				}
 				i += 6
@@ -202,6 +234,9 @@ func (s *streamScan) scanStringSpan(p int64, decode bool) (end int64, decoded st
 				return p, "", errMalformed // raw control char in string
 			}
 			if decode {
+				if e := ensure(1); e != nil {
+					return p, "", e
+				}
 				sb.WriteByte(c)
 			}
 			i++
@@ -408,7 +443,11 @@ func (s *streamScan) skipComposite(p int64) (int64, error) {
 		// Value token begins at i (phase 0 for arrays, phase 2).
 		switch b {
 		case '{', '[':
-			if len(stack) >= maxJSONDepth {
+			limit := s.depthLimit
+			if limit == 0 {
+				limit = maxJSONDepth
+			}
+			if len(stack) >= limit {
 				return p, errTooDeep
 			}
 			stack = append(stack, frameState{isObj: b == '{', first: true})
@@ -550,9 +589,21 @@ func (s *streamScan) number(p int64) (int64, error) {
 // routing-field scalars are decoded; large member values are validated and
 // left on disk — nothing complete is materialised. Validation completes
 // before any upstream side effect, which is what the disk spool exists for.
-func inspectFrameStream(r io.Reader) (frameInfo, error) {
+func inspectFrameStream(r io.Reader, leases ...*requestLease) (frameInfo, error) {
 	var info frameInfo
-	s := newStreamScan(r)
+	var s *streamScan
+	if len(leases) > 0 {
+		bufBytes, chunkBytes := int64(128<<10), int64(16<<10)
+		if file, ok := r.(*os.File); ok {
+			if stat, e := file.Stat(); e == nil {
+				bufBytes = min(bufBytes, stat.Size()+1)
+				chunkBytes = min(chunkBytes, stat.Size()+1)
+			}
+		}
+		s = &streamScan{r: r, buf: make([]byte, 0, int(bufBytes)), readChunk: make([]byte, int(chunkBytes)), window: 64 << 10, lease: leases[0]}
+	} else {
+		s = newStreamScan(r)
+	}
 
 	p, err := s.skipWSPos(0)
 	if err != nil {
@@ -598,6 +649,9 @@ func inspectFrameStream(r io.Reader) (frameInfo, error) {
 		}
 		if b != '"' {
 			return info, errMalformed
+		}
+		if s.lease != nil && !s.lease.grow(512) {
+			return info, errWorkBudget
 		}
 		keyEnd, key, err := s.scanStringSpan(p, true)
 		if err != nil {

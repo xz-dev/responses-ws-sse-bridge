@@ -26,7 +26,7 @@ func regressPair(t *testing.T, handler http.HandlerFunc, override func(*config))
 	t.Helper()
 	up := httptest.NewServer(handler)
 	u, _ := url.Parse(up.URL)
-	cfg := config{upstream: u, maxSockets: 64, maxMsgBytes: 16 << 20, maxBodyBytes: 16 << 20}
+	cfg := config{upstream: u, maxMsgBytes: 16 << 20, maxBodyBytes: 16 << 20}
 	if override != nil {
 		override(&cfg)
 	}
@@ -77,27 +77,48 @@ func regressMaskedFrame(c net.Conn, fin bool, opcode byte, payload []byte) error
 	return err
 }
 func regressRawRead(br *bufio.Reader) (byte, []byte, error) {
-	h := make([]byte, 2)
-	if _, e := io.ReadFull(br, h); e != nil {
-		return 0, nil, e
-	}
-	n := int(h[1] & 127)
-	if n == 126 {
-		b := make([]byte, 2)
-		if _, e := io.ReadFull(br, b); e != nil {
+	var message []byte
+	var opcode byte
+	for {
+		var h [2]byte
+		if _, e := io.ReadFull(br, h[:]); e != nil {
 			return 0, nil, e
 		}
-		n = int(binary.BigEndian.Uint16(b))
+		n := int(h[1] & 127)
+		if n == 126 {
+			var extended [2]byte
+			if _, e := io.ReadFull(br, extended[:]); e != nil {
+				return 0, nil, e
+			}
+			n = int(binary.BigEndian.Uint16(extended[:]))
+		}
+		if n == 127 || h[1]&128 != 0 {
+			return 0, nil, fmt.Errorf("unsupported/masked server fixture frame")
+		}
+		part := make([]byte, n)
+		if _, e := io.ReadFull(br, part); e != nil {
+			return 0, nil, e
+		}
+		op := h[0] & 15
+		if opcode == 0 {
+			opcode = op
+		} else if op != 0 {
+			return 0, nil, fmt.Errorf("expected continuation, got opcode %d", op)
+		}
+		message = append(message, part...)
+		if h[0]&128 != 0 {
+			return opcode, message, nil
+		}
+		if opcode != 1 && opcode != 2 {
+			return 0, nil, fmt.Errorf("fragmented control frame")
+		}
 	}
-	p := make([]byte, n)
-	_, e := io.ReadFull(br, p)
-	return h[0] & 15, p, e
 }
 func TestRegressionRawControlInsideFragment(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(regressSSE))
 	defer up.Close()
 	u, _ := url.Parse(up.URL)
-	bs := httptest.NewServer(newBridge(config{upstream: u, maxSockets: 2, maxMsgBytes: 4096, maxBodyBytes: 4096}))
+	bs := httptest.NewServer(newBridge(config{upstream: u, maxMsgBytes: 4096, maxBodyBytes: 4096, workBytes: 1 << 20}))
 	defer bs.Close()
 	a, _ := url.Parse(bs.URL)
 	c, e := net.Dial("tcp", a.Host)
@@ -198,7 +219,7 @@ func TestRegressionHTTPChatDONEByteForByte(t *testing.T) {
 	}))
 	defer up.Close()
 	u, _ := url.Parse(up.URL)
-	bs := httptest.NewServer(newBridge(config{upstream: u, maxSockets: 1, maxMsgBytes: 1024, maxBodyBytes: 1024}))
+	bs := httptest.NewServer(newBridge(config{upstream: u, maxMsgBytes: 1024, maxBodyBytes: 1024}))
 	defer bs.Close()
 	resp, err := http.Post(bs.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"m","stream":true}`))
 	if err != nil {
@@ -349,18 +370,19 @@ func TestRegressionMalformedSSEPayloadIsNotRelayed(t *testing.T) {
 	}
 }
 
-func TestRegressionIdleTimeoutEnforced(t *testing.T) {
+func TestRegressionIdleTurnWaitsForBackend(t *testing.T) {
 	_, c := regressPair(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.(http.Flusher).Flush()
-		<-r.Context().Done()
-	}, func(cfg *config) { cfg.turnIdle = 30 * time.Millisecond })
+		select {
+		case <-time.After(120 * time.Millisecond):
+			regressSSE(w, r)
+		case <-r.Context().Done():
+		}
+	}, nil)
 	regressSend(t, c, []byte(`{"type":"response.create","model":"m","input":[]}`))
-	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Millisecond)
-	defer cancel()
-	_, _, err := c.Read(ctx)
-	if ctx.Err() != nil {
-		t.Fatalf("idle timeout setting ignored: %v", err)
+	if got := regressRead(t, c); !bytes.Contains(got, []byte(`"response.completed"`)) {
+		t.Fatalf("pipe expired idle backend turn: %s", got)
 	}
 }
 
@@ -404,43 +426,52 @@ func TestRegressionNoRedirectFollowing(t *testing.T) {
 	}
 }
 
-func TestRegressionQueueOverloadAnswersEveryRequest(t *testing.T) {
-	gate := make(chan struct{})
+func TestRegressionQueuedCreatesCompleteFIFO(t *testing.T) {
+	gate, release := context.WithCancel(context.Background())
+	defer release()
 	started := make(chan struct{}, 1)
 	var calls atomic.Int32
 	_, c := regressPair(t, func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Model string `json:"model"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+			return
+		}
 		calls.Add(1)
 		select {
 		case started <- struct{}{}:
 		default:
 		}
 		select {
-		case <-gate:
+		case <-gate.Done():
 		case <-r.Context().Done():
 			return
 		}
-		regressSSE(w, r)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintf(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":%q,\"output\":[]}}\n\n", body.Model)
 	}, nil)
-	raw := []byte(`{"type":"response.create","model":"m","input":[]}`)
-	regressSend(t, c, raw)
+	regressSend(t, c, []byte(`{"type":"response.create","model":"turn_0","input":[]}`))
 	<-started
-	for i := 0; i < 5; i++ {
-		regressSend(t, c, raw)
+	for i := 1; i < 6; i++ {
+		regressSend(t, c, []byte(fmt.Sprintf(`{"type":"response.create","model":"turn_%d","input":[]}`, i)))
 	}
-	time.Sleep(30 * time.Millisecond)
-	close(gate)
-	replies := 0
-	for {
-		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-		_, _, err := c.Read(ctx)
-		cancel()
-		if err != nil {
-			break
+	release()
+	for i := 0; i < 6; i++ {
+		got := regressRead(t, c)
+		var event struct {
+			Type     string `json:"type"`
+			Response struct {
+				ID string `json:"id"`
+			} `json:"response"`
 		}
-		replies++
+		if err := json.Unmarshal(got, &event); err != nil || event.Type != "response.completed" || event.Response.ID != fmt.Sprintf("turn_%d", i) {
+			t.Fatalf("queued turn %d was rejected or reordered: %s (%v)", i, got, err)
+		}
 	}
-	if replies != 6 {
-		t.Fatalf("six requests got only %d replies; upstream calls=%d; overload signals coalesced", replies, calls.Load())
+	if calls.Load() != 6 {
+		t.Fatalf("upstream completed %d turns, want six", calls.Load())
 	}
 }
 
@@ -494,7 +525,7 @@ func TestRegressionIdleHeartbeatIsData(t *testing.T) {
 			time.Sleep(15 * time.Millisecond)
 		}
 		regressSSE(w, r)
-	}, func(c *config) { c.turnIdle = 45 * time.Millisecond })
+	}, nil)
 	regressSend(t, c, []byte(`{"type":"response.create","model":"m","input":[]}`))
 	got := regressRead(t, c)
 	if !bytes.Contains(got, []byte(`"response.completed"`)) {
@@ -502,17 +533,18 @@ func TestRegressionIdleHeartbeatIsData(t *testing.T) {
 	}
 }
 
-func TestRegressionIdleBeforeHeaders(t *testing.T) {
+func TestRegressionHeaderWaitHasNoPipeExpiry(t *testing.T) {
 	_, c := regressPair(t, func(w http.ResponseWriter, r *http.Request) {
-		io.Copy(io.Discard, r.Body)
-		<-r.Context().Done()
-	}, func(c *config) { c.turnIdle = 30 * time.Millisecond })
+		_, _ = io.Copy(io.Discard, r.Body)
+		select {
+		case <-time.After(120 * time.Millisecond):
+			regressSSE(w, r)
+		case <-r.Context().Done():
+		}
+	}, nil)
 	regressSend(t, c, []byte(`{"type":"response.create","model":"m","input":[]}`))
-	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
-	defer cancel()
-	_, b, e := c.Read(ctx)
-	if e != nil {
-		t.Fatalf("no protocol error when upstream has not sent headers: %v payload=%s", e, b)
+	if got := regressRead(t, c); !bytes.Contains(got, []byte(`"response.completed"`)) {
+		t.Fatalf("pipe expired before upstream headers: %s", got)
 	}
 }
 
@@ -527,7 +559,7 @@ func TestRegressionQueuedSpoolRemovedOnDisconnect(t *testing.T) {
 	}))
 	defer up.Close()
 	u, _ := url.Parse(up.URL)
-	b := newBridge(config{upstream: u, maxSockets: 2, maxMsgBytes: 1 << 20, maxBodyBytes: 1 << 20})
+	b := newBridge(config{upstream: u, maxMsgBytes: 1 << 20, maxBodyBytes: 1 << 20})
 	bs := httptest.NewServer(b)
 	defer bs.Close()
 	c, _, e := websocket.Dial(context.Background(), "ws"+strings.TrimPrefix(bs.URL, "http")+"/v1/responses", nil)
@@ -553,7 +585,7 @@ func TestRegressionQueuedSpoolRemovedOnDisconnect(t *testing.T) {
 	}
 	c.CloseNow()
 	for time.Now().Before(until) {
-		if len(b.sockets) == 0 {
+		if b.work.Load() == 0 {
 			break
 		}
 		time.Sleep(time.Millisecond)

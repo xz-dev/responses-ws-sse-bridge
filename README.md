@@ -52,8 +52,10 @@ for the tested Sub2API passthrough and owner-gate incompatibilities.
     object; socket stays open.
   - Truncated/malformed upstream stream → `response.failed` frame if a
     response had started, else an `error` frame.
-- **Turns are sequential** per socket; at most one frame queues behind the
-  in-flight turn, anything beyond gets an explicit overload `error` frame.
+- **Turns are sequential** per socket. Valid creates queue in FIFO order while
+  their actual spool/bookkeeping bytes fit the shared working budget; there is
+  no fixed queue or global session count. The reader never writes application
+  errors behind a blocked turn writer.
 - Control frames are handled by the library (ping→pong). Client close cancels
   the in-flight upstream request.
 - Nothing is retained between turns or across sockets.
@@ -65,22 +67,27 @@ for the tested Sub2API passthrough and owner-gate incompatibilities.
 | `UPSTREAM_URL` | *(required)* | Sub2API base URL, `http(s)`, no query/userinfo |
 | `LISTEN_ADDR` | `:8080` | Listen address |
 | `PORT` | *(unset)* | Optional healthcheck-only override: probe `127.0.0.1:$PORT` instead of `LISTEN_ADDR`. Does not change the server listener. |
-| `MAX_SOCKETS` | `64` | Live WebSockets; overflow handshake → 503 |
 | `MAX_MESSAGE_BYTES` | `16777216` | Max incoming WS frame bytes |
 | `MAX_BODY_BYTES` | `16777216` | Per-event bound: max bytes of one upstream error body or one SSE event |
-| `WORK_MAX_BYTES` | `268435456` | Global working-byte budget for in-flight request spools |
+| `WORK_MAX_BYTES` | `268435456` | Hard admission budget for session state, request/event spool data and physical overhead, queue metadata, and bounded parser/copy windows |
 | `SPOOL_DIR` | `$TMPDIR` (`/tmp`; `/spool` in the image) | Directory for bounded request spools; must be writable by the runtime user |
-| `TURN_IDLE_TIMEOUT_SECONDS` | `0` | Upstream **inactivity** timeout; `0` disables (upstream has its own 60s idle) |
 
-## Idle-timeout semantics
+## Forwarding lifetime and resources
 
-`TURN_IDLE_TIMEOUT_SECONDS` bounds **upstream inactivity**, never total
-turn length. The timer starts when the POST is issued — so it also covers
-waiting for response headers — and resets on every byte read from the
-upstream body, including SSE comment/heartbeat lines and partial event
-data that the parser does not surface as events. On fire it cancels the
-upstream request and ends the turn with the declared failure terminal
-(`response.failed` if a response had started, else an `error` frame).
+Established turns and application writes have no bridge-local expiry. The
+client, upstream and transport determine completion/cancellation. Existing
+WebSocket control/close grace and HTTP health/header-establishment protection
+remain separate. Genuine working-byte exhaustion can refuse a handshake or
+terminate an active connection without waiting to deliver an error through a
+blocked destination; it is not a queue-count rejection.
+
+Each upgraded connection reserves bounded state and its retained header sizes.
+Request spools and one upstream event at a time reserve growth before writes;
+queued spools keep no open descriptors. Files stay charged until close/unlink.
+Kernel TCP buffers, filesystem-wide metadata and pre-upgrade HTTP parsing are
+runtime resources, not falsely counted as application heap. Deployment resource
+acceptance must measure the actual container envelope; a zero counter is not an
+RSS or kernel-memory measurement.
 
 ## Request path
 
