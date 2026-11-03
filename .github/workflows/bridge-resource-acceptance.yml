@@ -1,0 +1,107 @@
+# Isolated, synthetic resource acceptance of an already-published immutable image.
+# No main/publish trigger, app image build/push, production access or provisioning.
+name: Bridge isolated resource acceptance
+on:
+  push:
+    branches: [maintenance/bridge-resource-acceptance]
+permissions:
+  contents: read
+jobs:
+  isolated-rootless-ext4:
+    if: github.ref == 'refs/heads/maintenance/bridge-resource-acceptance'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      ROOT: /var/tmp/ai-gateway-transparent-pipes-20261103/bridge-runtime-acceptance
+      REF: /var/tmp/ai-gateway-transparent-pipes-20261103/bridge-implementation/repo
+      SOURCE_SHA: b482f7128b5f904c50a123889a22030aaa890d8a
+      IMAGE_DIGEST: c7c010be8e71f9ebc5365af315ce0b7323a1403593d9661d3c1ba0586ba40c35
+      GOTOOLCHAIN: local
+      GOPATH: ${{ runner.temp }}/bridge-go
+      GOMODCACHE: ${{ runner.temp }}/bridge-go/pkg/mod
+    steps:
+      - name: Checkout resource-only maintenance branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Checkout exact approved app metadata (never build app)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: b482f7128b5f904c50a123889a22030aaa890d8a
+          path: _approved-app
+          persist-credentials: false
+      - name: Prepare private harness and validate parent attestation
+        shell: bash
+        env:
+          # Sanitized evidence only: no host paths, addresses, credentials or inventory.
+          PARENT_ATTESTATION: '{"source_approved":true,"actual_image_run_authorized":true,"source_sha":"b482f7128b5f904c50a123889a22030aaa890d8a","ci_source_sha":"b482f7128b5f904c50a123889a22030aaa890d8a","ci_conclusion":"success","ci_url":"https://github.com/xz-dev/responses-ws-sse-bridge/actions/runs/41602112775","image":"ghcr.io/xz-dev/responses-ws-sse-bridge:b482f7128b5f904c50a123889a22030aaa890d8a@sha256:c7c010be8e71f9ebc5365af315ce0b7323a1403593d9661d3c1ba0586ba40c35","filesystem_comparison_approved":true,"deployment_statfs":{"type":"ef53","block_size":4096,"blocks":7712784,"measured_at":"2026-11-03T08:32:17.597005+00:00"}}'
+        run: |
+          set -eu
+          umask 077
+          test ! -e "$ROOT"
+          mkdir -p "$ROOT" "$REF"
+          chmod 0700 "$ROOT" "$REF"
+          cp resource-acceptance/bridge/{main.go,accept.py,test_runner.py,build.sh,README.md} "$ROOT/"
+          cp _approved-app/{go.mod,go.sum} "$REF/"
+          chmod 0400 "$REF/go.mod" "$REF/go.sum"
+          python3 - <<'PY'
+          import datetime,json,os,pathlib,re
+          p=json.loads(os.environ['PARENT_ATTESTATION'])
+          sha=os.environ['SOURCE_SHA']; digest=os.environ['IMAGE_DIGEST']
+          assert p['source_approved'] is True and p['actual_image_run_authorized'] is True
+          assert p['source_sha']==p['ci_source_sha']==sha and p['ci_conclusion']=='success'
+          assert re.fullmatch(r'https://github\.com/[^/]+/[^/]+/actions/runs/41602112775',p['ci_url'])
+          assert re.fullmatch(r'[^@\s]+:'+sha+r'@sha256:'+digest,p['image'])
+          assert not p['image'].startswith('INVALID')
+          fs=p['deployment_statfs']; assert fs['type']=='ef53' and fs['block_size']==4096 and fs['blocks']>0
+          age=(datetime.datetime.now(datetime.timezone.utc)-datetime.datetime.fromisoformat(fs['measured_at'].replace('Z','+00:00'))).total_seconds()
+          assert 0<=age<86400 and p['filesystem_comparison_approved'] is True
+          pathlib.Path(os.environ['ROOT'],'approval.json').write_text(json.dumps(p))
+          PY
+      - name: Verify preinstalled local rootless runtime; no provisioning fallback
+        shell: bash
+        run: |
+          set -eu
+          umask 077
+          unset CONTAINER_HOST CONTAINER_CONNECTION DOCKER_HOST DOCKER_CONTEXT PODMAN_CONNECTIONS_CONF
+          command -v podman >/dev/null
+          command -v go >/dev/null
+          podman --remote=false info --format=json | python3 -c 'import json,sys; p=json.load(sys.stdin); assert p["host"]["security"]["rootless"] is True and p["host"].get("serviceIsRemote") is False'
+          go version > "$ROOT/compiler.txt"
+      - name: Fetch pinned approved module dependencies; offline helper build and tests
+        shell: bash
+        run: |
+          set -eu
+          umask 077
+          export GOCACHE="$RUNNER_TEMP/bridge-dependency-cache"
+          before=$(sha256sum "$REF/go.mod" "$REF/go.sum")
+          go -C "$REF" mod download > "$ROOT/dependency-download.log" 2>&1
+          test "$before" = "$(sha256sum "$REF/go.mod" "$REF/go.sum")"
+          cd "$ROOT"
+          sh ./build.sh > build-validation.log 2>&1
+          sha256sum main.go accept.py test_runner.py build.sh README.md probe > SHA256SUMS
+          sha256sum -c SHA256SUMS > checksum-validation.log
+      - name: Pull approved published immutable image through normal public method
+        shell: bash
+        run: |
+          set -eu
+          umask 077
+          unset CONTAINER_HOST CONTAINER_CONNECTION DOCKER_HOST DOCKER_CONTEXT PODMAN_CONNECTIONS_CONF
+          image=$(python3 -c 'import json,os,pathlib; print(json.loads(pathlib.Path(os.environ["ROOT"],"approval.json").read_text())["image"])')
+          podman --remote=false pull "$image" > "$ROOT/image-pull.log" 2>&1
+      - name: Run unchanged immutable image with rootless harness and measured volume filesystem
+        shell: bash
+        run: |
+          set -eu
+          umask 077
+          image=$(python3 -c 'import json,os,pathlib; print(json.loads(pathlib.Path(os.environ["ROOT"],"approval.json").read_text())["image"])')
+          cd "$ROOT"
+          python3 ./accept.py "$image" "$SOURCE_SHA" ./approval.json > invocation-result.json
+      - name: Upload all private-generated synthetic evidence (not production acceptance)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: bridge-resource-evidence-${{ github.run_id }}
+          path: /var/tmp/ai-gateway-transparent-pipes-20261103/bridge-runtime-acceptance/
+          if-no-files-found: error
+          retention-days: 7
