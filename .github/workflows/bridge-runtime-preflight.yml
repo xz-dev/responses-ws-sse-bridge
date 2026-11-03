@@ -1,0 +1,63 @@
+name: bridge-runtime-preflight
+on:
+  push:
+    branches: [maintenance/bridge-runtime-preflight]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Read isolated runner capabilities without workloads
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 - <<'PY'
+          import datetime, json, os, pathlib, shutil, subprocess
+          out = {'utc': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'uid': os.getuid(), 'no_image_pull_or_container_workload': True}
+          env = dict(os.environ)
+          for key in ('CONTAINER_HOST', 'CONTAINER_CONNECTION', 'DOCKER_HOST'):
+              env.pop(key, None)
+          out['podman_available'] = bool(shutil.which('podman'))
+          out['skopeo_available'] = bool(shutil.which('skopeo'))
+          out['runtime_dir_exists'] = pathlib.Path(env.get('XDG_RUNTIME_DIR', '/run/user/' + str(os.getuid()))).is_dir()
+          out['user_bus_exists'] = pathlib.Path('/run/user/' + str(os.getuid()) + '/bus').exists()
+          out['cgroup_membership'] = pathlib.Path('/proc/self/cgroup').read_text().strip()
+          out['cgroup_v2'] = pathlib.Path('/sys/fs/cgroup/cgroup.controllers').exists()
+          out['controllers'] = pathlib.Path('/sys/fs/cgroup/cgroup.controllers').read_text().split() if out['cgroup_v2'] else []
+          if out['podman_available']:
+              p = subprocess.run(['podman', '--remote=false', 'info', '--format', 'json'], env=env, capture_output=True, text=True, timeout=45)
+              out['podman_info_exit'] = p.returncode
+              if p.returncode == 0:
+                  info = json.loads(p.stdout)
+                  host = info.get('host', {})
+                  out['rootless'] = host.get('security', {}).get('rootless')
+                  out['cgroup_version'] = host.get('cgroupVersion')
+                  out['cgroup_manager'] = host.get('cgroupManager')
+                  out['podman_controllers'] = host.get('cgroupControllers', [])
+                  out['podman_version'] = info.get('version', {}).get('Version')
+                  graph = pathlib.Path(info['store']['graphRoot'])
+                  q = subprocess.run(['stat', '-f', '-c', '%t %S %b %a', str(graph)], capture_output=True, text=True, check=True)
+                  fs = q.stdout.split()
+                  out['graph_statfs'] = {'type': fs[0].lower(), 'block_size': int(fs[1]), 'blocks': int(fs[2]), 'available_blocks': int(fs[3])}
+              else:
+                  out['podman_error'] = p.stderr[-2500:]
+          delegated = pathlib.Path('/sys/fs/cgroup/user.slice/user-' + str(os.getuid()) + '.slice/user@' + str(os.getuid()) + '.service')
+          out['user_manager_cgroup_exists'] = delegated.is_dir()
+          out['user_manager_delegated_writable'] = os.access(delegated / 'cgroup.subtree_control', os.W_OK)
+          out['potential_ext4_rootless_runtime'] = bool(out.get('rootless') is True and out.get('graph_statfs', {}).get('type') == 'ef53' and out.get('cgroup_version') == 'v2' and {'cpu', 'memory', 'pids'} <= set(out.get('controllers', [])))
+          out['actual_limit_enforcement_proven'] = False
+          pathlib.Path('runtime-capabilities.json').write_text(json.dumps(out, indent=2))
+          print(json.dumps(out, indent=2))
+          assert os.getuid() != 0, 'runner must remain unprivileged'
+          assert out['potential_ext4_rootless_runtime'], 'isolated ext4/rootless/cgroup capability not established'
+          PY
+      - name: Preserve capability evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridge-runtime-capabilities
+          path: runtime-capabilities.json
+          if-no-files-found: error
