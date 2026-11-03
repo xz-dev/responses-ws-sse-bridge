@@ -30,6 +30,11 @@ jobs:
           ref: b482f7128b5f904c50a123889a22030aaa890d8a
           path: _approved-app
           persist-credentials: false
+      - name: Select Go matching approved module
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: _approved-app/go.mod
+          cache: false
       - name: Prepare private harness and validate parent attestation
         shell: bash
         env:
