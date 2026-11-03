@@ -17,8 +17,8 @@ jobs:
       SOURCE_SHA: b482f7128b5f904c50a123889a22030aaa890d8a
       IMAGE_DIGEST: c7c010be8e71f9ebc5365af315ce0b7323a1403593d9661d3c1ba0586ba40c35
       GOTOOLCHAIN: local
-      GOPATH: ${{ runner.temp }}/bridge-go
-      GOMODCACHE: ${{ runner.temp }}/bridge-go/pkg/mod
+      GOPATH: /var/tmp/bridge-resource-go
+      GOMODCACHE: /var/tmp/bridge-resource-go/pkg/mod
     steps:
       - name: Checkout resource-only maintenance branch
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
