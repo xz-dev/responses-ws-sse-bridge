@@ -89,8 +89,12 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
-	if msg <= 0 || body <= 0 || work < 0 || disk < 0 || reserve < 0 {
+	if msg <= 0 || body <= 0 || work < 0 || disk < 0 {
 		return config{}, errors.New("limits must be positive")
+	}
+	if reserve <= 0 {
+		// 0 would disable the D3 free-disk floor (review m8).
+		return config{}, errors.New("DISK_RESERVE_BYTES must be positive")
 	}
 	spoolDir := os.Getenv("SPOOL_DIR")
 	if spoolDir == "" {
@@ -105,7 +109,7 @@ func loadConfig() (config, error) {
 			return config{}, fmt.Errorf("CAPACITY_LEDGER_DIR %q is not a directory", ledgerDir)
 		}
 	} else {
-		log.Printf("CAPACITY_LEDGER_DIR unset: admission ticket leases are not enforced")
+		log.Printf("CAPACITY_LEDGER_DIR unset: requests of %d bytes or more are refused", int64(ticketThreshold))
 	}
 	return config{
 		listen: listenAddr(), upstream: u,

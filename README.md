@@ -53,11 +53,15 @@ for the tested Sub2API passthrough and owner-gate incompatibilities.
   - Truncated/malformed upstream stream → `response.failed` frame if a
     response had started, else an `error` frame.
 - **Turns are sequential** per socket. Valid creates queue in FIFO order while
-  their actual spool/bookkeeping bytes fit the shared working budget; there is
-  no fixed queue or global session count. The reader never writes application
-  errors behind a blocked turn writer.
+  their bytes fit the memory and spool disk budgets; there is no fixed queue or
+  global session count. The reader never writes application frames. A local
+  refusal (size, budget, disk, ticket) is answered in FIFO order with an
+  `error` event that carries `code` and `hop`, then a coded close; after a
+  refusal the reader keeps reading and discards later messages, so a client
+  close still cancels the in-flight turn.
 - Control frames are handled by the library (ping→pong). Client close cancels
-  the in-flight upstream request.
+  the in-flight upstream request. Every session-ending path closes the queued
+  spools before the error event and the close frame.
 - Nothing is retained between turns or across sockets.
 
 ## Configuration
@@ -67,10 +71,29 @@ for the tested Sub2API passthrough and owner-gate incompatibilities.
 | `UPSTREAM_URL` | *(required)* | Sub2API base URL, `http(s)`, no query/userinfo |
 | `LISTEN_ADDR` | `:8080` | Listen address |
 | `PORT` | *(unset)* | Optional healthcheck-only override: probe `127.0.0.1:$PORT` instead of `LISTEN_ADDR`. Does not change the server listener. |
-| `MAX_MESSAGE_BYTES` | `16777216` | Max incoming WS frame bytes |
-| `MAX_BODY_BYTES` | `16777216` | Per-event bound: max bytes of one upstream error body or one SSE event |
-| `WORK_MAX_BYTES` | `268435456` | Hard admission budget for session state, request/event spool data and physical overhead, queue metadata, and bounded parser/copy windows |
-| `SPOOL_DIR` | `$TMPDIR` (`/tmp`; `/spool` in the image) | Directory for bounded request spools; must be writable by the runtime user |
+| `MAX_MESSAGE_BYTES` | `268435456` | Max incoming WS message bytes, counted by the bridge after reassembly and inflation (`request_too_large` with `limit`) |
+| `MAX_BODY_BYTES` | `268435456` | Per-event bound: max bytes of one upstream error body or one SSE event |
+| `WORK_MAX_BYTES` | `67108864` | Memory budget: session state, queue metadata, read/scan/upload/event windows and the inflater. Exhaustion: 503 `working_set_unavailable` |
+| `SPOOL_MAX_BYTES` | `4 × (MAX_MESSAGE_BYTES + MAX_BODY_BYTES)` | Spool disk budget: physical bytes of request and event spools. Exhaustion: 503 `spool_budget_exhausted` |
+| `DISK_RESERVE_BYTES` | `1073741824` | Free-disk floor (D3); a spool write that would cross it gets 507 `insufficient_storage`. Must be positive |
+| `SPOOL_DIR` | `$TMPDIR` (`/spool` in the image) | Spool directory. Must be mode 0700, on disk (tmpfs/ramfs refused), support `O_TMPFILE` and hold no named file; otherwise the bridge refuses to start. `/tmp` (1777) is refused |
+| `CAPACITY_LEDGER_DIR` | *(unset)* | Read-only capacity ledger (D4). Unset: every request of 64 MiB or more is refused |
+
+### Capacity tickets (D4)
+
+A request of 64 MiB or more needs an admission ticket from keeper: the
+`X-AI-Gateway-Capacity-Ticket` header on HTTP, or the top-level frame member
+`ai_gateway_capacity_ticket` on WS. Keeper writes that member **first**; the
+bridge reads it from a 512-byte prefix and takes a blocking `LOCK_SH` on the
+ticket file (`O_RDONLY`, `st_nlink > 0` checked) before it spools any byte. The
+lease is dropped after the spool closes. The bridge strips the member and
+forwards the header to Sub2API only. Refusals are 503 `capacity_ticket_missing`
+(no ticket at 64 MiB, raised as the frame or chunked body crosses 64 MiB) and
+503 `capacity_ticket_invalid` (malformed, unopenable, released, not the first
+member, or no ledger configured).
+
+Request bodies exist on disk only while a request is in flight, in anonymous
+`O_TMPFILE` spools that are never named, logged or backed up.
 
 ## Forwarding lifetime and resources
 
@@ -83,7 +106,9 @@ blocked destination; it is not a queue-count rejection.
 
 Each upgraded connection reserves bounded state and its retained header sizes.
 Request spools and one upstream event at a time reserve growth before writes;
-queued spools keep no open descriptors. Files stay charged until close/unlink.
+each queued spool holds its one anonymous descriptor, charged until it closes.
+Spool writes `fdatasync` and drop their pages every 8 MiB, and every spool read
+drops pages as it goes, which bounds the page cache a spool keeps (D3).
 Kernel TCP buffers, filesystem-wide metadata and pre-upgrade HTTP parsing are
 runtime resources, not falsely counted as application heap. Deployment resource
 acceptance must measure the actual container envelope; a zero counter is not an

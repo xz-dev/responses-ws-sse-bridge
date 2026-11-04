@@ -32,7 +32,7 @@ func isLocalRefusal(err error) bool {
 }
 
 func requestTooLarge(limit int64) *apiError {
-	return &apiError{Status: http.StatusRequestEntityTooLarge, Type: "invalid_request_error", Code: "request_too_large", Hop: bridgeHop,
+	return &apiError{Status: http.StatusRequestEntityTooLarge, Type: "invalid_request_error", Code: "request_too_large", Hop: bridgeHop, Limit: limit,
 		Message: fmt.Sprintf("Request exceeds the %d-byte WebSocket message limit of %s.", limit, bridgeHop)}
 }
 

@@ -30,7 +30,8 @@ func (b *bridge) relayHTTPError(ctx context.Context, conn *websocket.Conn, respo
 		n, e := response.Body.Read(buf)
 		if n > 0 {
 			if spool.msg.size+int64(n) > b.cfg.maxBodyBytes {
-				b.sendErrorFrame(ctx, conn, errTooLarge)
+				b.sendErrorFrame(ctx, conn, &apiError{Status: http.StatusBadGateway, Type: "upstream_error", Code: "upstream_error_too_large", Hop: bridgeHop, Limit: b.cfg.maxBodyBytes,
+					Message: fmt.Sprintf("upstream HTTP %d error body exceeds the %d-byte limit of %s", response.StatusCode, b.cfg.maxBodyBytes, bridgeHop)})
 				return nil
 			}
 			if _, e := spool.Write(buf[:n]); e != nil {
@@ -39,7 +40,8 @@ func (b *bridge) relayHTTPError(ctx context.Context, conn *websocket.Conn, respo
 		}
 		if e != nil {
 			if e != io.EOF {
-				b.sendErrorFrame(ctx, conn, errTooLarge)
+				b.sendErrorFrame(ctx, conn, &apiError{Status: http.StatusBadGateway, Type: "upstream_error", Code: "upstream_error_truncated", Hop: bridgeHop,
+					Message: fmt.Sprintf("upstream HTTP %d error body could not be read: %v", response.StatusCode, e)})
 				return nil
 			}
 			break
@@ -58,18 +60,20 @@ func (b *bridge) relayHTTPError(ctx context.Context, conn *websocket.Conn, respo
 		if first[0] != 'n' {
 			writer, e := conn.Writer(ctx, websocket.MessageText)
 			if e != nil {
-				return e
+				return fmt.Errorf("%w: %w", errMidMessage, e)
 			}
-			if _, e = fmt.Fprintf(writer, `{"type":"error","status":%d,"error":`, response.StatusCode); e != nil {
-				return e
+			if _, e = fmt.Fprintf(writer, `{"type":"error","status":%d,"error":`, response.StatusCode); e == nil {
+				if e = copyEventSpan(writer, spool.file, value.start, value.end, buf); e == nil {
+					if _, e = io.WriteString(writer, "}"); e == nil {
+						e = writer.Close()
+					}
+				}
 			}
-			if e := copyEventSpan(writer, spool.file, value.start, value.end, buf); e != nil {
-				return e
+			if e != nil {
+				// A message is open: only a close can follow (review m1).
+				return fmt.Errorf("%w: %w", errMidMessage, e)
 			}
-			if _, e := io.WriteString(writer, "}"); e != nil {
-				return e
-			}
-			return writer.Close()
+			return nil
 		}
 	}
 	// Only a bounded text prefix is retained for non-JSON upstream errors.

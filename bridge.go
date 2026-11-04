@@ -51,7 +51,7 @@ func newBridge(cfg config) *bridge {
 		MaxIdleConnsPerHost: 64,
 		DisableCompression:  true, // upstream SSE must pass through uncompressed
 	}
-	return &bridge{
+	b := &bridge{
 		cfg: cfg,
 		client: &http.Client{
 			Transport: tr,
@@ -67,12 +67,53 @@ func newBridge(cfg config) *bridge {
 			},
 			Transport:     tr,
 			FlushInterval: -1,
-			ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-				log.Printf("native proxy: upstream request failed: %v", err)
-				writeJSONError(w, http.StatusBadGateway, "upstream_error", "", "upstream request failed")
-			},
 		},
 	}
+	b.proxy.ErrorHandler = b.nativeProxyError
+	return b
+}
+
+func (b *bridge) nativeProxyError(w http.ResponseWriter, r *http.Request, err error) {
+	if g, ok := r.Context().Value(unticketedKey{}).(*unticketedBody); ok && g.refusal() != nil {
+		writeAPIError(w, b.failureAPIError(g.refusal()))
+		return
+	}
+	log.Printf("native proxy: upstream request failed: %v", err)
+	writeAPIError(w, &apiError{Status: http.StatusBadGateway, Type: "upstream_error", Code: "upstream_request_failed", Hop: bridgeHop, Message: "upstream request failed"})
+}
+
+type unticketedKey struct{}
+
+// unticketedBody passes a native body of unknown length until it reaches
+// 64 MiB without a lease, then fails the upload with the ticket refusal.
+type unticketedBody struct {
+	io.ReadCloser
+	b    *bridge
+	id   string
+	n    int64
+	mu   sync.Mutex
+	stop error
+}
+
+func (g *unticketedBody) Read(p []byte) (int, error) {
+	if err := g.refusal(); err != nil {
+		return 0, err
+	}
+	k, err := g.ReadCloser.Read(p)
+	if _, refused := g.b.admitTicket(g.n+int64(k), g.id); refused != nil {
+		g.mu.Lock()
+		g.stop = refused
+		g.mu.Unlock()
+		return 0, refused
+	}
+	g.n += int64(k)
+	return k, err
+}
+
+func (g *unticketedBody) refusal() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.stop
 }
 
 func (b *bridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -96,6 +137,12 @@ func (b *bridge) serveNative(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer lease.release() // held until the proxied exchange has finished
+	if r.ContentLength < 0 && lease == nil && r.Body != nil && r.Body != http.NoBody {
+		// A chunked body's size is learned late: refuse it as it crosses 64 MiB.
+		g := &unticketedBody{ReadCloser: r.Body, b: b, id: r.Header.Get(ticketHeader)}
+		r = r.WithContext(context.WithValue(r.Context(), unticketedKey{}, g))
+		r.Body = g
+	}
 	b.proxy.ServeHTTP(w, r)
 }
 
@@ -121,6 +168,7 @@ type apiError struct {
 	Code    string `json:"code,omitempty"`
 	Param   string `json:"param,omitempty"`
 	Hop     string `json:"hop,omitempty"`
+	Limit   int64  `json:"limit,omitempty"` // the byte limit a size refusal names
 	Message string `json:"message"`
 }
 
@@ -133,17 +181,9 @@ var (
 )
 
 func writeAPIError(w http.ResponseWriter, e *apiError) {
-	writeJSONError(w, e.Status, e.Type, e.Code, e.Message)
-}
-
-func writeJSONError(w http.ResponseWriter, status int, typ, code, msg string) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	errObj := map[string]any{"type": typ, "message": msg}
-	if code != "" {
-		errObj["code"] = code
-	}
-	enc, _ := json.Marshal(map[string]any{"error": errObj})
+	w.WriteHeader(e.Status)
+	enc, _ := json.Marshal(map[string]any{"error": e})
 	_, _ = w.Write(enc)
 }
 
@@ -268,7 +308,7 @@ func (b *bridge) serveWS(w http.ResponseWriter, r *http.Request) {
 		turnCtx, stopTurn := context.WithCancel(ctx)
 		if msg.typ != websocket.MessageText {
 			msg.release()
-			b.sendErrorFrame(ctx, conn, &apiError{Status: http.StatusBadRequest, Type: "invalid_request_error", Message: "unsupported WebSocket frame type; send text frames containing response.create events"})
+			b.sendErrorFrame(ctx, conn, &apiError{Status: http.StatusBadRequest, Type: "invalid_request_error", Code: "unsupported_frame_type", Hop: bridgeHop, Message: "unsupported WebSocket frame type; send text frames containing response.create events"})
 			stopTurn()
 			continue
 		}
@@ -335,6 +375,9 @@ func (b *bridge) sendErrorFrame(ctx context.Context, conn *websocket.Conn, e *ap
 	}
 	if e.Hop != "" {
 		errObj["hop"] = e.Hop
+	}
+	if e.Limit != 0 {
+		errObj["limit"] = e.Limit
 	}
 	frame := map[string]any{"type": "error", "error": errObj}
 	if e.Status != 0 {
@@ -532,11 +575,11 @@ type wsMsgLite struct {
 // turn's reader-owned spool lease remains charged through validation and POST.
 func (b *bridge) handleTurnStream(ctx context.Context, conn *websocket.Conn, spool *os.File, size int64, leasedID string, headers http.Header, path string) error {
 	if spool == nil {
-		b.sendErrorFrame(ctx, conn, &apiError{Status: http.StatusBadRequest, Type: "invalid_request_error", Message: "could not read frame"})
+		b.sendErrorFrame(ctx, conn, &apiError{Status: http.StatusBadRequest, Type: "invalid_request_error", Code: "frame_unreadable", Hop: bridgeHop, Message: "could not read frame"})
 		return nil
 	}
 	if size > b.cfg.maxMsgBytes {
-		b.sendErrorFrame(ctx, conn, errTooLarge)
+		b.sendErrorFrame(ctx, conn, requestTooLarge(b.cfg.maxMsgBytes))
 		return nil
 	}
 
@@ -554,11 +597,11 @@ func (b *bridge) handleTurnStream(ctx context.Context, conn *websocket.Conn, spo
 		return err
 	}
 	if err != nil {
-		msg := "invalid JSON in WebSocket frame"
+		code, msg := "invalid_json", "invalid JSON in WebSocket frame"
 		if errors.Is(err, errTooDeep) {
-			msg = fmt.Sprintf("JSON nesting exceeds the %d-level depth limit", maxJSONDepth)
+			code, msg = "json_too_deep", fmt.Sprintf("JSON nesting exceeds the %d-level depth limit", maxJSONDepth)
 		}
-		b.sendErrorFrame(ctx, conn, &apiError{Status: http.StatusBadRequest, Type: "invalid_request_error", Message: msg})
+		b.sendErrorFrame(ctx, conn, &apiError{Status: http.StatusBadRequest, Type: "invalid_request_error", Code: code, Hop: bridgeHop, Message: msg})
 		return nil
 	}
 	if !info.isCreate {
@@ -568,7 +611,7 @@ func (b *bridge) handleTurnStream(ctx context.Context, conn *websocket.Conn, spo
 		}
 		defer release()
 		quoted, _ := json.Marshal(info.typeVal)
-		b.sendErrorFrame(ctx, conn, &apiError{Status: http.StatusBadRequest, Type: "invalid_request_error", Message: fmt.Sprintf("unsupported frame type %s; expected response.create", quoted)})
+		b.sendErrorFrame(ctx, conn, &apiError{Status: http.StatusBadRequest, Type: "invalid_request_error", Code: "unsupported_event_type", Hop: bridgeHop, Message: fmt.Sprintf("unsupported frame type %s; expected response.create", quoted)})
 		return nil
 	}
 	if info.havePrevID {
