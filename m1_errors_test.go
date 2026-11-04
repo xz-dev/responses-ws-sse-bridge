@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/coder/websocket"
 )
@@ -15,9 +14,7 @@ import (
 // carries a code (never a bare close: no -1, no 1006, no 1009).
 func readCloseAfter(t *testing.T, conn *websocket.Conn, want websocket.StatusCode) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_, data, err := conn.Read(ctx)
+	_, data, err := conn.Read(context.Background())
 	if err == nil {
 		t.Fatalf("want close %d, got another message %s", want, data)
 	}

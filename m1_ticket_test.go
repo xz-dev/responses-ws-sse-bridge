@@ -2,13 +2,14 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
-	"time"
 
 	"github.com/coder/websocket"
 )
@@ -61,16 +62,34 @@ func TestM1TicketStrippedForwardedAndLocked(t *testing.T) {
 	if hdr.Get(ticketHeader) != testTicket {
 		t.Fatalf("ticket header = %q", hdr.Get(ticketHeader))
 	}
-	// After the turn the lock is gone, so keeper's LOCK_EX can proceed.
+	// After the turn the lock is dropped, so keeper's blocking LOCK_EX is
+	// granted (a leaked lease hangs here until the go test timeout).
 	f, _ := os.Open(filepath.Join(ledger, testTicket))
 	defer f.Close()
-	deadline := time.Now().Add(2 * time.Second)
-	for syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) != nil {
-		if time.Now().After(deadline) {
-			t.Fatal("shared lock outlived the turn")
-		}
-		time.Sleep(5 * time.Millisecond)
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
 	}
+}
+
+// flockWaiting reports whether /proc/locks lists a blocked FLOCK waiter on
+// the inode of path (a " -> " line), i.e. someone is inside flock(2).
+func flockWaiting(t *testing.T, path string) bool {
+	t.Helper()
+	var st syscall.Stat_t
+	if err := syscall.Stat(path, &st); err != nil {
+		t.Fatal(err)
+	}
+	locks, err := os.ReadFile("/proc/locks")
+	if err != nil {
+		t.Fatal(err)
+	}
+	suffix := fmt.Sprintf(":%d ", st.Ino)
+	for _, l := range strings.Split(string(locks), "\n") {
+		if strings.Contains(l, "-> FLOCK") && strings.Contains(l, suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestM1TicketMissingAndReleased(t *testing.T) {
@@ -109,7 +128,9 @@ func TestM1TicketUnlinkedWhileWaiting(t *testing.T) {
 	}
 	done := make(chan error, 1)
 	go func() { _, err := b.admitTicket(ticketThreshold, testTicket); done <- err }()
-	time.Sleep(50 * time.Millisecond) // let admitTicket block in flock
+	for !flockWaiting(t, path) { // admitTicket has opened the file and blocks in flock
+		runtime.Gosched()
+	}
 	_ = os.Remove(path)
 	_ = syscall.Flock(int(keeper.Fd()), syscall.LOCK_UN)
 	if err := <-done; err == nil || !strings.Contains(err.Error(), "already released") {

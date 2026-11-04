@@ -12,7 +12,6 @@ import (
 	"net/url"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/coder/websocket"
 )
@@ -31,7 +30,6 @@ func TestM1FragmentedOverLimitGetsErrorEvent(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	c.SetDeadline(time.Now().Add(5 * time.Second))
 	fmt.Fprintf(c, "GET /v1/responses HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n", a.Host)
 	br := bufio.NewReader(c)
 	if resp, err := http.ReadResponse(br, nil); err != nil || resp.StatusCode != 101 {
@@ -61,9 +59,7 @@ func TestM1FragmentedOverLimitGetsErrorEvent(t *testing.T) {
 
 func dialDeflate(t *testing.T, p *pair) *websocket.Conn {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	c, resp, err := websocket.Dial(ctx, wsURL(p.bSrv.URL)+"/v1/responses", &websocket.DialOptions{CompressionMode: websocket.CompressionNoContextTakeover, CompressionThreshold: 1})
+	c, resp, err := websocket.Dial(context.Background(), wsURL(p.bSrv.URL)+"/v1/responses", &websocket.DialOptions{CompressionMode: websocket.CompressionNoContextTakeover, CompressionThreshold: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
