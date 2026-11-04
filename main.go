@@ -40,7 +40,6 @@ type config struct {
 	spoolDir         string // dir for request spools; "" = os.TempDir()
 	diskReserveBytes int64  // spool writes refuse below this much free disk (D3)
 	ledgerDir        string // read-only capacity ledger (D4); "" = gate off
-	cgroupDir        string // own cgroup v2 dir for headroom refusal; "" = off
 }
 
 func listenAddr() string {
@@ -110,7 +109,6 @@ func loadConfig() (config, error) {
 		spoolDir:         spoolDir,
 		diskReserveBytes: reserve,
 		ledgerDir:        ledgerDir,
-		cgroupDir:        defaultCgroupDir(),
 	}, nil
 }
 

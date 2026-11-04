@@ -17,8 +17,6 @@ const bridgeHop = "responses-ws-sse-bridge"
 var (
 	// errInsufficientStorage: a spool write would cross the disk reserve (D3).
 	errInsufficientStorage = errors.New("spool write refused: free disk would fall below the reserve")
-	// errInsufficientMemory: this hop's cgroup headroom cannot cover the step.
-	errInsufficientMemory = errors.New("cgroup memory headroom unavailable")
 	// errCommunicated wraps a failure whose terminal event already reached
 	// the client (response.failed or an error frame); only the close remains.
 	errCommunicated = errors.New("failure already communicated")
@@ -30,7 +28,7 @@ var (
 // isLocalRefusal: a resource refusal by this hop, which the client must see
 // as an explicit error rather than a transport failure.
 func isLocalRefusal(err error) bool {
-	return errors.Is(err, errWorkBudget) || errors.Is(err, errInsufficientStorage) || errors.Is(err, errInsufficientMemory)
+	return errors.Is(err, errWorkBudget) || errors.Is(err, errInsufficientStorage)
 }
 
 func requestTooLarge(limit int64) *apiError {
@@ -50,9 +48,6 @@ func (b *bridge) failureAPIError(err error) *apiError {
 	case errors.Is(err, errInsufficientStorage):
 		return &apiError{Status: http.StatusInsufficientStorage, Type: "server_error", Code: "insufficient_storage", Hop: bridgeHop,
 			Message: fmt.Sprintf("%s spool refused: free disk would fall below the %d-byte reserve.", bridgeHop, b.cfg.diskReserveBytes)}
-	case errors.Is(err, errInsufficientMemory):
-		return &apiError{Status: http.StatusServiceUnavailable, Type: "server_error", Code: "insufficient_memory", Hop: bridgeHop,
-			Message: fmt.Sprintf("%s cgroup memory headroom is below the required step plus the 32 MiB margin.", bridgeHop)}
 	default:
 		var ticket *ticketError
 		if errors.As(err, &ticket) {
@@ -67,7 +62,7 @@ func closeCodeFor(err error) (websocket.StatusCode, string) {
 	switch {
 	case errors.Is(err, errTooLarge):
 		return websocket.StatusNormalClosure, "request too large"
-	case errors.Is(err, errWorkBudget), errors.Is(err, errInsufficientStorage), errors.Is(err, errInsufficientMemory):
+	case errors.Is(err, errWorkBudget), errors.Is(err, errInsufficientStorage):
 		return websocket.StatusTryAgainLater, "capacity unavailable"
 	default:
 		return websocket.StatusInternalError, "turn failed"

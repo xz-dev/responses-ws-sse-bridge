@@ -10,8 +10,6 @@ import (
 	"strings"
 	"syscall"
 	"testing"
-
-	"github.com/coder/websocket"
 )
 
 const testTicket = "0123456789abcdef0123456789abcdef"
@@ -136,45 +134,4 @@ func TestM1TicketUnlinkedWhileWaiting(t *testing.T) {
 	if err := <-done; err == nil || !strings.Contains(err.Error(), "already released") {
 		t.Fatalf("want released refusal, got %v", err)
 	}
-}
-
-func TestM1CgroupHeadroomRefusal(t *testing.T) {
-	cg := t.TempDir()
-	b := requestTestBridge(t, 1<<20)
-	b.cfg.cgroupDir = cg
-	write := func(max, cur string) {
-		_ = os.WriteFile(filepath.Join(cg, "memory.max"), []byte(max+"\n"), 0o600)
-		_ = os.WriteFile(filepath.Join(cg, "memory.current"), []byte(cur+"\n"), 0o600)
-	}
-	write("max", "1")
-	if err := b.memHeadroom(turnMemStep); err != nil {
-		t.Fatalf("unbounded cgroup refused: %v", err)
-	}
-	write("268435456", "200000000")
-	if err := b.memHeadroom(turnMemStep); err != nil {
-		t.Fatalf("ample headroom refused: %v", err)
-	}
-	write("268435456", "230000000") // 38 MB left < step + 32 MiB
-	err := b.memHeadroom(turnMemStep)
-	if e := b.failureAPIError(err); e.Status != 503 || e.Code != "insufficient_memory" || e.Hop != bridgeHop {
-		t.Fatalf("tight headroom: %v %+v", err, e)
-	}
-	_ = os.Remove(filepath.Join(cg, "memory.current"))
-	if err := b.memHeadroom(turnMemStep); err == nil {
-		t.Fatal("unreadable cgroup passed silently")
-	}
-}
-
-// The WS turn path reports the headroom refusal as an explicit event.
-func TestM1CgroupRefusalOnTurnIsExplicit(t *testing.T) {
-	cg := t.TempDir()
-	_ = os.WriteFile(filepath.Join(cg, "memory.max"), []byte("100000000\n"), 0o600)
-	_ = os.WriteFile(filepath.Join(cg, "memory.current"), []byte("99000000\n"), 0o600)
-	p := startPair(t, newSSEUpstream(t), func(c *config) { c.cgroupDir = cg })
-	defer p.close()
-	conn := dial(t, p, "/v1/responses", nil)
-	defer conn.CloseNow()
-	writeFrame(t, conn, `{"type":"response.create","model":"m","input":[]}`)
-	requireErrorEvent(t, readEvent(t, conn), "insufficient_memory")
-	readCloseAfter(t, conn, websocket.StatusTryAgainLater)
 }

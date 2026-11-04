@@ -21,9 +21,6 @@ type eventSpoolReader struct {
 }
 
 func (b *bridge) newEventSpoolReader(body io.Reader, max int64) (*eventSpoolReader, error) {
-	if err := b.memHeadroom(eventMemStep); err != nil {
-		return nil, err
-	}
 	release := b.acquire(eventWindowBytes)
 	if release == nil {
 		return nil, errWorkBudget

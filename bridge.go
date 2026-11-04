@@ -369,9 +369,6 @@ func (b *bridge) spoolFrame(frame io.Reader) (m wsMsgLite) {
 	if b.cfg.maxMsgBytes+1 < readBytes {
 		readBytes = b.cfg.maxMsgBytes + 1
 	}
-	if err := b.memHeadroom(turnMemStep); err != nil {
-		return wsMsgLite{err: err}
-	}
 	release := b.acquire(readBytes)
 	if release == nil {
 		return wsMsgLite{err: errWorkBudget}
