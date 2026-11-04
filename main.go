@@ -65,33 +65,40 @@ func loadConfig() (config, error) {
 	default:
 		return config{}, errors.New("UPSTREAM_URL scheme must be http or https")
 	}
-	msg, err := envInt64("MAX_MESSAGE_BYTES", 16<<20)
+	// The end-to-end cap (large-request-capacity D1): 256 MiB.
+	msg, err := envInt64("MAX_MESSAGE_BYTES", 256<<20)
 	if err != nil {
 		return config{}, err
 	}
-	body, err := envInt64("MAX_BODY_BYTES", 16<<20)
+	body, err := envInt64("MAX_BODY_BYTES", 256<<20)
 	if err != nil {
 		return config{}, err
 	}
-	work, err := envInt64("WORK_MAX_BYTES", 256<<20)
+	// 0 derives the budget from the limits in newBridge.
+	work, err := envInt64("WORK_MAX_BYTES", 0)
 	if err != nil {
 		return config{}, err
 	}
-	if msg <= 0 || body <= 0 || work <= 0 {
+	reserve, err := envInt64("DISK_RESERVE_BYTES", defaultReserve)
+	if err != nil {
+		return config{}, err
+	}
+	if msg <= 0 || body <= 0 || work < 0 || reserve < 0 {
 		return config{}, errors.New("limits must be positive")
 	}
 	spoolDir := os.Getenv("SPOOL_DIR")
 	if spoolDir == "" {
 		spoolDir = os.TempDir()
 	}
-	if st, err := os.Stat(spoolDir); err != nil || !st.IsDir() {
-		return config{}, fmt.Errorf("SPOOL_DIR %q is not a usable directory (set it or TMPDIR to a writable dir; the image ships /spool)", spoolDir)
+	if err := checkSpoolDir(spoolDir); err != nil {
+		return config{}, err
 	}
 	return config{
 		listen: listenAddr(), upstream: u,
 		maxMsgBytes: msg, maxBodyBytes: body,
-		workBytes: work,
-		spoolDir:  spoolDir,
+		workBytes:        work,
+		spoolDir:         spoolDir,
+		diskReserveBytes: reserve,
 	}, nil
 }
 

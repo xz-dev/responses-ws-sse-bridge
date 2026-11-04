@@ -48,7 +48,7 @@ func (p *eventSpoolReader) next(ctx context.Context) (result *chargedSpool, err 
 				return errWorkBudget
 			}
 			var e error
-			event, e = p.bridge.newChargedSpool("bridge-event-*.json")
+			event, e = p.bridge.newChargedSpool()
 			if e != nil {
 				return e
 			}

@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -582,8 +581,7 @@ func TestRegressionQueuedSpoolRemovedOnDisconnect(t *testing.T) {
 	regressSend(t, c, raw)
 	until := time.Now().Add(time.Second)
 	for time.Now().Before(until) {
-		fs, _ := os.ReadDir(dir)
-		if len(fs) >= 2 {
+		if len(openSpools(t, dir)) >= 2 {
 			break
 		}
 		time.Sleep(time.Millisecond)
@@ -596,13 +594,8 @@ func TestRegressionQueuedSpoolRemovedOnDisconnect(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	time.Sleep(20 * time.Millisecond)
-	fs, _ := os.ReadDir(dir)
-	if len(fs) != 0 {
-		var names []string
-		for _, f := range fs {
-			names = append(names, f.Name())
-		}
-		t.Fatalf("after socket handler exited, leaked spool files: %v", names)
+	if open := openSpools(t, dir); len(open) != 0 {
+		t.Fatalf("after socket handler exited, leaked %d spool files", len(open))
 	}
 }
 

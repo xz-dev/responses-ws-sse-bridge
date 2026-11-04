@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/url"
 	"os"
-	"path/filepath"
 	"sync"
 	"syscall"
 	"testing"
@@ -24,9 +23,8 @@ func assertRequestResourcesZero(t *testing.T, b *bridge) {
 	if got := b.work.Load(); got != 0 {
 		t.Fatalf("working bytes leaked: %d", got)
 	}
-	files, err := filepath.Glob(filepath.Join(b.cfg.spoolDir, "bridge-turn-*"))
-	if err != nil || len(files) != 0 {
-		t.Fatalf("spool files leaked: %v (%v)", files, err)
+	if open := openSpools(t, b.cfg.spoolDir); len(open) != 0 {
+		t.Fatalf("spool files leaked: %d open anonymous spools", len(open))
 	}
 }
 
@@ -38,11 +36,10 @@ func TestRequestSpoolPositiveAndPhysicalCharge(t *testing.T) {
 	if msg.err != nil {
 		t.Fatal(msg.err)
 	}
-	got, err := os.ReadFile(msg.name)
-	if err != nil || !bytes.Equal(got, want) {
-		t.Fatalf("positive control changed bytes: %v", err)
+	if got := readSpool(t, msg.file); !bytes.Equal(got, want) {
+		t.Fatal("positive control changed bytes")
 	}
-	stat, err := os.Stat(msg.name)
+	stat, err := msg.file.Stat()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,17 +72,18 @@ func TestRequestFIFOLeasesAndClosedDescriptors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(after) > len(before)+1 {
-		t.Fatalf("queued spools retained descriptors: %d -> %d", len(before), len(after))
+	// D3: anonymous spools have no name to reopen, so each queued create
+	// holds exactly its own descriptor until release.
+	if got := len(openSpools(t, b.cfg.spoolDir)); got != 20 || len(after) > len(before)+21 {
+		t.Fatalf("queued spools: %d open spools, fds %d -> %d", got, len(before), len(after))
 	}
 	for i := 0; i < 20; i++ {
 		msg, ok := q.pop(context.Background())
 		if !ok {
 			t.Fatal("FIFO dropped accepted create")
 		}
-		data, err := os.ReadFile(msg.name)
-		if err != nil || !bytes.Equal(data, []byte{byte(i)}) {
-			t.Fatalf("FIFO ordering/content: %d %v %v", i, data, err)
+		if data := readSpool(t, msg.file); !bytes.Equal(data, []byte{byte(i)}) {
+			t.Fatalf("FIFO ordering/content: %d %v", i, data)
 		}
 		msg.release()
 	}

@@ -9,8 +9,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -46,9 +44,8 @@ func TestTransparentPartialSpoolsChargedBeforeEOF(t *testing.T) {
 		if got := b.work.Load(); got != 0 {
 			t.Errorf("after all readers joined/released: quota=%d", got)
 		}
-		files, _ := filepath.Glob(filepath.Join(b.cfg.spoolDir, "bridge-turn-*"))
-		if len(files) != 0 {
-			t.Errorf("partial spools leaked: %v", files)
+		if open := openSpools(t, b.cfg.spoolDir); len(open) != 0 {
+			t.Errorf("partial spools leaked: %d", len(open))
 		}
 	})
 	for i := 0; i < 8; i++ {
@@ -77,18 +74,7 @@ func TestTransparentPartialSpoolsChargedBeforeEOF(t *testing.T) {
 		}
 	}
 	var materialized int64
-	files, err := filepath.Glob(filepath.Join(b.cfg.spoolDir, "bridge-turn-*"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, name := range files {
-		stat, err := os.Stat(name)
-		if os.IsNotExist(err) {
-			continue // A quota-rejected spool may have just completed unlink.
-		}
-		if err != nil {
-			t.Fatal(err)
-		}
+	for _, stat := range openSpools(t, b.cfg.spoolDir) {
 		materialized += stat.Size()
 	}
 	charged := b.work.Load()

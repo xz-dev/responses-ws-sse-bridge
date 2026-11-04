@@ -36,8 +36,9 @@ type bridge struct {
 
 func newBridge(cfg config) *bridge {
 	if cfg.workBytes <= 0 {
-		// Default: four max-size frames resident — a budget, not a leak.
-		cfg.workBytes = 4 * cfg.maxMsgBytes
+		// Default: two max-size frames plus two max-size events at the spool's
+		// conservative 2x physical charge — a budget, not a leak.
+		cfg.workBytes = 4*cfg.maxMsgBytes + 4*cfg.maxBodyBytes
 	}
 	tr := &http.Transport{
 		Proxy:               nil, // no proxy env: deterministic egress to the inner APISIX
@@ -244,11 +245,7 @@ func (b *bridge) serveWS(w http.ResponseWriter, r *http.Request) {
 			_ = conn.Close(websocket.StatusInvalidFramePayloadData, "invalid utf-8")
 			return
 		}
-		spool, err := os.Open(msg.name)
-		if err == nil {
-			err = b.handleTurnStream(turnCtx, conn, spool, msg.size, headers, path)
-			_ = spool.Close()
-		}
+		err := b.handleTurnStream(turnCtx, conn, msg.file, msg.size, headers, path)
 		msg.release()
 		stopTurn()
 		if err != nil {
@@ -310,16 +307,16 @@ func (b *bridge) acquire(n int64) func() {
 	return func() { b.work.Add(-n) }
 }
 
-// release keeps file bytes charged until its descriptor is closed and its
-// pathname removed. An unlink failure retains the lease rather than lying
-// about freed disk capacity.
+// release closes the anonymous spool, which frees its blocks, then returns
+// the lease. A close failure retains the lease rather than lying about
+// freed disk capacity.
 func (m *wsMsgLite) release() {
-	if m.name != "" {
-		if err := os.Remove(m.name); err != nil && !os.IsNotExist(err) {
+	if m.file != nil {
+		if err := m.file.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
 			log.Printf("request spool cleanup failed: %v", err)
 			return
 		}
-		m.name = ""
+		m.file = nil
 	}
 	if m.lease != nil {
 		m.lease.release()
@@ -339,16 +336,15 @@ func (b *bridge) spoolFrame(frame io.Reader) (m wsMsgLite) {
 		return wsMsgLite{err: errWorkBudget}
 	}
 	defer release()
-	spool, err := b.newChargedSpool("bridge-turn-*.json")
+	spool, err := b.newChargedSpool()
 	if err != nil {
 		return wsMsgLite{err: err}
 	}
 	defer func() {
-		if err := spool.close(); m.err == nil && err != nil {
-			m.err = err
-		}
+		// On success the open anonymous file is handed to the worker in m.
 		if m.err != nil {
 			spool.release()
+			m.file = nil
 		}
 	}()
 	buf := make([]byte, int(readBytes))
@@ -385,11 +381,11 @@ func (b *bridge) spoolFrame(frame io.Reader) (m wsMsgLite) {
 	}
 }
 
-// wsMsgLite is the reader→worker handoff. Closed files avoid a file
-// descriptor per queued create; the worker reopens only its active spool.
+// wsMsgLite is the reader→worker handoff. Each queued create holds its open
+// anonymous spool (no name exists to reopen); closing it frees the blocks.
 type wsMsgLite struct {
 	typ    websocket.MessageType
-	name   string
+	file   *os.File
 	size   int64
 	badUTF bool
 	remote bool // err came from the socket, not a local refusal
@@ -424,6 +420,7 @@ func (b *bridge) handleTurnStream(ctx context.Context, conn *websocket.Conn, spo
 	}
 	defer parseLease.release()
 	info, err := inspectFrameStream(spool, parseLease)
+	dropCache(spool)
 	if errors.Is(err, errWorkBudget) {
 		return err
 	}
@@ -472,6 +469,7 @@ func (b *bridge) handleTurnStream(ctx context.Context, conn *websocket.Conn, spo
 		}
 	}
 	body, bodyLen := rewrittenBody(spool, info)
+	body = &cacheDroppingReader{r: body, f: spool}
 	return b.runUpstream(ctx, conn, body, bodyLen, headers, path)
 }
 

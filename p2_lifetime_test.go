@@ -161,15 +161,7 @@ func TestSmallBlockedHTTPUploadWindowsCharged(t *testing.T) {
 		block = 4096
 	}
 	var physical int64
-	files, e := os.ReadDir(b.cfg.spoolDir)
-	if e != nil {
-		t.Fatal(e)
-	}
-	for _, file := range files {
-		stat, e := file.Info()
-		if e != nil {
-			t.Fatal(e)
-		}
+	for _, stat := range openSpools(t, b.cfg.spoolDir) {
 		data := block
 		for data < stat.Size() {
 			data *= 2
@@ -205,7 +197,7 @@ func TestSpoolRandomPhysicalAndMetadataAreDistinct(t *testing.T) {
 			b := requestTestBridge(t, 8<<20)
 			want := make([]byte, size)
 			_, _ = rand.New(rand.NewSource(27)).Read(want)
-			spool, e := b.newChargedSpool("bridge-physical-*.json")
+			spool, e := b.newChargedSpool()
 			if e != nil {
 				t.Fatal(e)
 			}
@@ -228,9 +220,8 @@ func TestSpoolRandomPhysicalAndMetadataAreDistinct(t *testing.T) {
 				}
 				at = end
 			}
-			got, e := os.ReadFile(spool.msg.name)
-			if e != nil || !bytes.Equal(got, want) {
-				t.Fatal("incompressible bytes changed", e)
+			if got := readSpool(t, spool.file); !bytes.Equal(got, want) {
+				t.Fatal("incompressible bytes changed")
 			}
 			spool.release()
 			assertRequestResourcesZero(t, b)
@@ -253,7 +244,7 @@ func TestSpooledEventJSONValidationAndDuplicateSemantics(t *testing.T) {
 	for _, raw := range cases {
 		t.Run(raw, func(t *testing.T) {
 			b := requestTestBridge(t, 8<<20)
-			spool, e := b.newChargedSpool("bridge-json-*.json")
+			spool, e := b.newChargedSpool()
 			if e != nil {
 				t.Fatal(e)
 			}

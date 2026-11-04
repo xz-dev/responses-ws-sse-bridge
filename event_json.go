@@ -257,7 +257,8 @@ func (b *bridge) writeEvent(ctx context.Context, conn *websocket.Conn, event *ch
 			return fmt.Errorf("%w: %w", errMidMessage, e)
 		}
 		writer = w
-		if e := copyEventSpan(writer, event.file, 0, event.msg.size, buf); e != nil {
+		src := &cacheDroppingReader{r: io.NewSectionReader(event.file, 0, event.msg.size), f: event.file}
+		if _, e := io.CopyBuffer(writer, src, buf); e != nil {
 			return fmt.Errorf("%w: %w", errMidMessage, e)
 		}
 	} else {

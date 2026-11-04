@@ -20,7 +20,7 @@ func (b *bridge) relayHTTPError(ctx context.Context, conn *websocket.Conn, respo
 		return errWorkBudget
 	}
 	defer release()
-	spool, e := b.newChargedSpool("bridge-error-*.json")
+	spool, e := b.newChargedSpool()
 	if e != nil {
 		return e
 	}
