@@ -175,9 +175,10 @@ func (b *bridge) serveWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.CloseNow()
-	// Library limit sits above the cap: spoolFrame reads at most cap+1 bytes
-	// and answers over-limit messages itself with an error event (D9).
-	conn.SetReadLimit(b.cfg.maxMsgBytes + 1)
+	// No library limit: spoolFrame counts every message against the cap and
+	// answers over-limit messages itself (D9), and a refused message is then
+	// drained, which a library limit would answer with a bare 1009.
+	conn.SetReadLimit(-1)
 	deflate := strings.Contains(w.Header().Get("Sec-WebSocket-Extensions"), "permessage-deflate")
 
 	headers := endToEndHeaders(r)
@@ -195,18 +196,13 @@ func (b *bridge) serveWS(w http.ResponseWriter, r *http.Request) {
 	defer dead()
 
 	// The reader never writes application frames or waits for queue slots.
-	// Each closed spool owns its hard-byte lease until the worker finishes.
+	// Each queued spool owns its leases until the worker releases it.
 	incoming := newRequestFIFO()
 	readerDone := make(chan struct{})
 	heldInflate := func() {}
 	go func() {
 		defer close(readerDone)
-		handedOff := false
-		defer func() {
-			if !handedOff {
-				dead()
-			}
-		}()
+		defer dead() // a read error: the client left or the session closed
 		for {
 			typ, reader, err := conn.Reader(context.Background())
 			if err != nil {
@@ -214,8 +210,8 @@ func (b *bridge) serveWS(w http.ResponseWriter, r *http.Request) {
 			}
 			var msg wsMsgLite
 			// The library's pooled inflater is live while a message is read;
-			// spoolFrame counts the inflated bytes against the cap. A message
-			// abandoned mid-read keeps its inflater until the socket closes.
+			// spoolFrame counts the inflated bytes against the cap. A refused
+			// message keeps its inflater charge until the socket closes.
 			if inflate := b.acquireIf(deflate, inflateBytes); inflate == nil {
 				msg = wsMsgLite{err: errWorkBudget}
 			} else if msg = b.spoolFrame(reader); msg.err != nil {
@@ -229,19 +225,21 @@ func (b *bridge) serveWS(w http.ResponseWriter, r *http.Request) {
 				if msg.remote {
 					return // the socket itself broke mid-message
 				}
-				// A local refusal (over-limit, budget, disk) is answered by the
-				// worker in FIFO order with an error event, then a close. The
-				// reader never writes application frames and stops reading.
-				failure := &wsMsgLite{err: msg.err}
-				handedOff = incoming.push(failure)
+				// A local refusal is answered by the worker in FIFO order with
+				// an error event, then a close. The reader keeps servicing the
+				// socket so a client close still ends the session (review B2).
+				incoming.push(&wsMsgLite{err: msg.err})
+				drainSocket(conn, reader)
 				return
 			}
 			if !incoming.push(&msg) {
-				msg.release()
+				msg.release() // the worker is ending the session
+				drainSocket(conn, nil)
 				return
 			}
 		}
 	}()
+	var active *wsMsgLite
 	defer func() {
 		dead()
 		incoming.close()
@@ -249,17 +247,23 @@ func (b *bridge) serveWS(w http.ResponseWriter, r *http.Request) {
 		_ = conn.CloseNow()
 		heldInflate()
 	}()
+	// Runs first, also on a panic: the active turn's spool and leases go.
+	defer func() { active.release() }()
 
-	// Only this worker emits application frames, in FIFO order.
+	// Only this worker emits application frames, in FIFO order. Every
+	// session-ending path frees the queued spools (and their ticket leases)
+	// before the error event and the close frame (review B1).
 	for {
 		msg, have := incoming.pop(ctx)
 		if !have {
 			return
 		}
 		if msg.err != nil {
+			incoming.close()
 			b.failTurn(ctx, conn, msg.err)
 			return
 		}
+		active = msg
 
 		turnCtx, stopTurn := context.WithCancel(ctx)
 		if msg.typ != websocket.MessageText {
@@ -271,6 +275,7 @@ func (b *bridge) serveWS(w http.ResponseWriter, r *http.Request) {
 		if msg.badUTF {
 			msg.release()
 			stopTurn()
+			incoming.close()
 			b.sendErrorFrame(ctx, conn, &apiError{Status: http.StatusBadRequest, Type: "invalid_request_error", Code: "invalid_utf8", Hop: bridgeHop, Message: "WebSocket text frame is not valid UTF-8"})
 			_ = conn.Close(websocket.StatusInvalidFramePayloadData, "invalid utf-8")
 			return
@@ -282,7 +287,32 @@ func (b *bridge) serveWS(w http.ResponseWriter, r *http.Request) {
 			if ctx.Err() != nil {
 				return // the client socket is gone; nothing can be delivered
 			}
+			incoming.close()
 			b.failTurn(ctx, conn, err)
+			return
+		}
+	}
+}
+
+// drainSocket discards the rest of cur and every later message without
+// spooling, until the socket fails or closes. Reading is what observes a
+// client close or the peer's close-handshake reply.
+func drainSocket(conn *websocket.Conn, cur io.Reader) {
+	var buf [drainBytes]byte // charged in sessionBaseBytes
+	for {
+		if cur != nil {
+			for {
+				_, err := cur.Read(buf[:])
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					return
+				}
+			}
+		}
+		var err error
+		if _, cur, err = conn.Reader(context.Background()); err != nil {
 			return
 		}
 	}
@@ -362,6 +392,9 @@ func (b *bridge) acquire(n int64) func() {
 // the lease. A close failure retains the lease rather than lying about
 // freed disk capacity.
 func (m *wsMsgLite) release() {
+	if m == nil {
+		return
+	}
 	if m.file != nil {
 		if err := m.file.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
 			log.Printf("request spool cleanup failed: %v", err)

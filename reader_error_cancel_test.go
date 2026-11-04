@@ -3,32 +3,41 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"runtime"
+	"strings"
 	"testing"
-	"time"
 
 	"github.com/coder/websocket"
 )
 
-// This tests actual client TCP close, not a Ping without a client reader.
-// The reader's queue-full application error must never prevent observing
-// cancellation when another application writer owns the transport mutex.
-func TestTransparentReaderErrorCancelsBlockedWriter(t *testing.T) {
+// readerDraining reports whether a socket reader goroutine has entered
+// drainSocket, i.e. it refused a message and handed the refusal to the worker.
+func readerDraining() bool {
+	buf := make([]byte, 1<<20)
+	return strings.Contains(string(buf[:runtime.Stack(buf, true)]), ".drainSocket(")
+}
+
+// Review B2: a reader-side refusal while a turn is in flight (the worker is
+// blocked in a real transport Write), then a client TCP close. The reader
+// must still observe the close, so the turn's upstream request, spools and
+// leases are released. Every wait is on a condition; a leak hangs until the
+// go test timeout.
+func TestReaderRefusalThenClientCloseReleasesTurn(t *testing.T) {
 	upDone := make(chan struct{})
-	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	up := newSSEUpstream(t)
+	up.sse = func(w http.ResponseWriter, r *http.Request) {
 		defer close(upDone)
-		_, _ = io.Copy(io.Discard, r.Body)
-		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprint(w, "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_a\"}}\n\n")
 		w.(http.Flusher).Flush()
 		<-r.Context().Done()
-	}))
-	t.Cleanup(up.Close)
-	u, _ := url.Parse(up.URL)
-	b := newBridge(config{upstream: u, maxMsgBytes: 4096, maxBodyBytes: 4096, workBytes: 1 << 20, diskBytes: 1 << 20, spoolDir: t.TempDir()})
+	}
+	uSrv := httptest.NewServer(up.handler())
+	t.Cleanup(uSrv.Close)
+	u, _ := url.Parse(uSrv.URL)
+	b := newBridge(config{upstream: u, maxMsgBytes: 4096, maxBodyBytes: 4096, spoolDir: t.TempDir()})
 	gl := &gatedListener{Listener: mustListen(t)}
 	handlerDone := make(chan struct{})
 	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -42,40 +51,32 @@ func TestTransparentReaderErrorCancelsBlockedWriter(t *testing.T) {
 		_ = server.Close()
 		<-joined
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	t.Cleanup(cancel)
+	ctx := context.Background()
 	conn, _, err := websocket.Dial(ctx, "ws://"+gl.Addr().String()+"/v1/responses", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = conn.CloseNow() })
-	frame := []byte(`{"type":"response.create","model":"m","input":[]}`)
-	if err := conn.Write(ctx, websocket.MessageText, frame); err != nil {
+	if err := conn.Write(ctx, websocket.MessageText, []byte(`{"type":"response.create","model":"m","input":[]}`)); err != nil {
 		t.Fatal(err)
 	}
 	gl.mu.Lock()
 	gate := gl.conns[0]
 	gl.mu.Unlock()
-	select {
-	case <-gate.entered:
-	case <-ctx.Done():
-		t.Fatal("worker did not enter real blocked transport Write")
+	<-gate.entered // the worker relays response.created into a blocked Write
+	over := `{"type":"response.create","model":"m","input":"` + strings.Repeat("x", 8192) + `"}`
+	if err := conn.Write(ctx, websocket.MessageText, []byte(over)); err != nil {
+		t.Fatal(err)
 	}
-	for i := 0; i < 2; i++ {
-		if err := conn.Write(ctx, websocket.MessageText, frame); err != nil {
-			t.Fatal(err)
-		}
+	for !readerDraining() {
+		runtime.Gosched()
 	}
 	if err := conn.CloseNow(); err != nil {
 		t.Fatal(err)
 	}
-	<-handlerDone // a write parked behind the blocked worker hangs here
-	select {
-	case <-upDone:
-	case <-ctx.Done():
-		t.Fatal("handler returned without releasing upstream")
-	}
-	if b.work.Load() != 0 {
-		t.Fatalf("cancel left %d working bytes charged", b.work.Load())
+	<-handlerDone
+	<-upDone
+	if b.work.Load() != 0 || b.disk.Load() != 0 || len(openSpools(t, b.cfg.spoolDir)) != 0 {
+		t.Fatalf("close left memory=%d disk=%d spools=%d", b.work.Load(), b.disk.Load(), len(openSpools(t, b.cfg.spoolDir)))
 	}
 }
