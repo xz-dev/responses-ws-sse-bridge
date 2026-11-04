@@ -594,7 +594,11 @@ func inspectFrameStream(r io.Reader, leases ...*requestLease) (frameInfo, error)
 	var s *streamScan
 	if len(leases) > 0 {
 		bufBytes, chunkBytes := int64(128<<10), int64(16<<10)
-		if file, ok := r.(*os.File); ok {
+		file, ok := r.(*os.File)
+		if c, dropping := r.(*cacheDroppingReader); dropping {
+			file, ok = c.f, true
+		}
+		if ok {
 			if stat, e := file.Stat(); e == nil {
 				bufBytes = min(bufBytes, stat.Size()+1)
 				chunkBytes = min(chunkBytes, stat.Size()+1)

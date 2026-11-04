@@ -74,7 +74,7 @@ func (b *bridge) relayHTTPError(ctx context.Context, conn *websocket.Conn, respo
 	}
 	// Only a bounded text prefix is retained for non-JSON upstream errors.
 	prefix := make([]byte, 0, 404)
-	reader := bufio.NewReaderSize(io.NewSectionReader(spool.file, 0, spool.msg.size), 4096)
+	reader := bufio.NewReaderSize(spoolSection(spool.file, 0, spool.msg.size), 4096)
 	leading, beyondNonSpace := true, false
 	for {
 		r, _, e := reader.ReadRune()

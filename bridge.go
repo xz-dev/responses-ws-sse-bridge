@@ -549,8 +549,7 @@ func (b *bridge) handleTurnStream(ctx context.Context, conn *websocket.Conn, spo
 		return errWorkBudget
 	}
 	defer parseLease.release()
-	info, err := inspectFrameStream(spool, parseLease)
-	dropCache(spool)
+	info, err := inspectFrameStream(&cacheDroppingReader{r: spool, f: spool}, parseLease)
 	if errors.Is(err, errWorkBudget) {
 		return err
 	}

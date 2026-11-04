@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"strings"
 
@@ -44,7 +45,7 @@ func (r *utf8EventReader) Read(p []byte) (int, error) {
 // without retaining their bytes. Duplicate members retain ordinary JSON
 // last-value semantics in the caller; only recognized small keys are decoded.
 func walkEventObject(src io.ReaderAt, start, size int64, visit func(eventMember) error) error {
-	checked := &utf8EventReader{r: io.NewSectionReader(src, start, size)}
+	checked := &utf8EventReader{r: spoolSection(src, start, size)}
 	s := &streamScan{r: checked, buf: make([]byte, 0, 128<<10), readChunk: make([]byte, 16<<10), window: 64 << 10, depthLimit: 9999}
 	p, e := s.skipWSPos(0)
 	if e != nil {
@@ -237,8 +238,18 @@ func (b *bridge) inspectEvent(event *chargedSpool) (info eventInfo, err error) {
 }
 
 func copyEventSpan(dst io.Writer, src io.ReaderAt, start, end int64, buf []byte) error {
-	_, e := io.CopyBuffer(dst, io.NewSectionReader(src, start, end-start), buf)
+	_, e := io.CopyBuffer(dst, spoolSection(src, start, end-start), buf)
 	return e
+}
+
+// spoolSection reads a span of src; a spool file's pages are dropped as it
+// is read, so every read-side pass keeps the page cache bounded (D3).
+func spoolSection(src io.ReaderAt, start, size int64) io.Reader {
+	r := io.NewSectionReader(src, start, size)
+	if f, ok := src.(*os.File); ok {
+		return &cacheDroppingReader{r: r, f: f}
+	}
+	return r
 }
 
 func (b *bridge) writeEvent(ctx context.Context, conn *websocket.Conn, event *chargedSpool, flatError bool) error {
@@ -257,8 +268,7 @@ func (b *bridge) writeEvent(ctx context.Context, conn *websocket.Conn, event *ch
 			return fmt.Errorf("%w: %w", errMidMessage, e)
 		}
 		writer = w
-		src := &cacheDroppingReader{r: io.NewSectionReader(event.file, 0, event.msg.size), f: event.file}
-		if _, e := io.CopyBuffer(writer, src, buf); e != nil {
+		if _, e := io.CopyBuffer(writer, spoolSection(event.file, 0, event.msg.size), buf); e != nil {
 			return fmt.Errorf("%w: %w", errMidMessage, e)
 		}
 	} else {
