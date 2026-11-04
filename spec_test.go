@@ -3,7 +3,7 @@ package main
 // Spec-conformance tests. Each name cites the governing section.
 //
 //   RFC 6455  — WebSocket wire protocol (fragmentation, control frames,
-//               close handshake, UTF-8 text validation, read-limit 1009).
+//               close handshake, UTF-8 text validation, over-limit error event + close, D9).
 //   WHATWG SSE — HTML §9.2 "event stream interpretation": line endings,
 //               BOM, comment lines, field parsing, dispatch on blank line.
 //   OpenAI    — Responses streaming/WS event semantics.

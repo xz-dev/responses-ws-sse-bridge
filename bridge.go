@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/http/httputil"
 	"os"
@@ -158,8 +159,12 @@ func (b *bridge) serveWS(w http.ResponseWriter, r *http.Request) {
 	defer sessionRelease()
 
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		OriginPatterns:  []string{"*"},
-		CompressionMode: websocket.CompressionDisabled,
+		OriginPatterns: []string{"*"},
+		// Inbound permessage-deflate is accepted so the bridge, not the
+		// library, answers inflated over-limit messages (D9); the threshold
+		// keeps every outbound message uncompressed.
+		CompressionMode:      websocket.CompressionNoContextTakeover,
+		CompressionThreshold: math.MaxInt32,
 	})
 	if err != nil {
 		log.Printf("ws accept failed: %v", err)
@@ -169,6 +174,7 @@ func (b *bridge) serveWS(w http.ResponseWriter, r *http.Request) {
 	// Library limit sits above the cap: spoolFrame reads at most cap+1 bytes
 	// and answers over-limit messages itself with an error event (D9).
 	conn.SetReadLimit(b.cfg.maxMsgBytes + 1)
+	deflate := strings.Contains(w.Header().Get("Sec-WebSocket-Extensions"), "permessage-deflate")
 
 	headers := endToEndHeaders(r)
 	headers.Del(ticketHeader) // each turn's ticket comes from its own frame
@@ -188,6 +194,7 @@ func (b *bridge) serveWS(w http.ResponseWriter, r *http.Request) {
 	// Each closed spool owns its hard-byte lease until the worker finishes.
 	incoming := newRequestFIFO()
 	readerDone := make(chan struct{})
+	heldInflate := func() {}
 	go func() {
 		defer close(readerDone)
 		handedOff := false
@@ -201,7 +208,17 @@ func (b *bridge) serveWS(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				return
 			}
-			msg := b.spoolFrame(reader)
+			var msg wsMsgLite
+			// The library's pooled inflater is live while a message is read;
+			// spoolFrame counts the inflated bytes against the cap. A message
+			// abandoned mid-read keeps its inflater until the socket closes.
+			if inflate := b.acquireIf(deflate, inflateBytes); inflate == nil {
+				msg = wsMsgLite{err: errWorkBudget}
+			} else if msg = b.spoolFrame(reader); msg.err != nil {
+				heldInflate = inflate
+			} else {
+				inflate()
+			}
 			msg.typ = typ
 			if msg.err != nil {
 				msg.release()
@@ -225,6 +242,8 @@ func (b *bridge) serveWS(w http.ResponseWriter, r *http.Request) {
 		dead()
 		incoming.close()
 		<-readerDone
+		_ = conn.CloseNow()
+		heldInflate()
 	}()
 
 	// Only this worker emits application frames, in FIFO order.
@@ -305,6 +324,18 @@ func (b *bridge) reserve(n int64) bool {
 			return true
 		}
 	}
+}
+
+// inflateBytes covers one pooled compress/flate decompressor and its 32 KiB
+// window, live while a permessage-deflate message is read.
+const inflateBytes = 64 << 10
+
+// acquireIf charges n only when cond holds; otherwise it is a no-op lease.
+func (b *bridge) acquireIf(cond bool, n int64) func() {
+	if !cond {
+		return func() {}
+	}
+	return b.acquire(n)
 }
 
 func (b *bridge) acquire(n int64) func() {
