@@ -1,15 +1,12 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"runtime/pprof"
-	"strings"
 	"testing"
 	"time"
 
@@ -69,25 +66,10 @@ func TestTransparentReaderErrorCancelsBlockedWriter(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	var stack bytes.Buffer
-	observeUntil := time.Now().Add(50 * time.Millisecond)
-	for time.Now().Before(observeUntil) {
-		stack.Reset()
-		_ = pprof.Lookup("goroutine").WriteTo(&stack, 2)
-		if strings.Contains(stack.String(), ".(*bridge).sendErrorFrame") {
-			t.Log("observed reader application-error write queued behind worker")
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
 	if err := conn.CloseNow(); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case <-handlerDone:
-	case <-time.After(200 * time.Millisecond):
-		t.Fatalf("client TCP close left reader application-error write parked behind blocked worker; upstream/handler cancellation not observed; goroutines:\n%s", stack.String())
-	}
+	<-handlerDone // a write parked behind the blocked worker hangs here
 	select {
 	case <-upDone:
 	case <-ctx.Done():

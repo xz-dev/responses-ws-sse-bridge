@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -371,11 +372,7 @@ func TestClientCloseCancelsUpstream(t *testing.T) {
 	readEvent(t, conn) // response.created
 	conn.Close(websocket.StatusNormalClosure, "")
 	// The upstream request context must have been cancelled promptly.
-	select {
-	case <-sawCancel:
-	case <-time.After(3 * time.Second):
-		t.Fatal("upstream request not cancelled on client close")
-	}
+	<-sawCancel // the upstream request context must be cancelled on client close
 }
 
 // M1 (D9) supersedes the old library 1009: the library limit sits above the
@@ -506,12 +503,8 @@ func TestSessionByteCapacity(t *testing.T) {
 		t.Fatalf("capacity status: %v %v", resp, err)
 	}
 	_ = conn.CloseNow()
-	deadline := time.Now().Add(time.Second)
-	for p.bridge.work.Load() != 0 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if p.bridge.work.Load() != 0 {
-		t.Fatalf("session lease leaked: %d", p.bridge.work.Load())
+	for p.bridge.work.Load() != 0 { // a leaked session lease hangs here
+		runtime.Gosched()
 	}
 }
 

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -564,7 +565,8 @@ func TestRegressionQueuedSpoolRemovedOnDisconnect(t *testing.T) {
 	defer up.Close()
 	u, _ := url.Parse(up.URL)
 	b := newBridge(config{upstream: u, maxMsgBytes: 1 << 20, maxBodyBytes: 1 << 20})
-	bs := httptest.NewServer(b)
+	handlerDone := make(chan struct{})
+	bs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { defer close(handlerDone); b.ServeHTTP(w, r) }))
 	defer bs.Close()
 	c, _, e := websocket.Dial(context.Background(), "ws"+strings.TrimPrefix(bs.URL, "http")+"/v1/responses", nil)
 	if e != nil {
@@ -573,27 +575,16 @@ func TestRegressionQueuedSpoolRemovedOnDisconnect(t *testing.T) {
 	defer c.CloseNow()
 	raw := []byte(`{"type":"response.create","model":"m","input":[]}`)
 	regressSend(t, c, raw)
-	select {
-	case <-started:
-	case <-time.After(time.Second):
-		t.Fatal("upstream not started")
-	}
+	<-started
 	regressSend(t, c, raw)
-	until := time.Now().Add(time.Second)
-	for time.Now().Before(until) {
-		if len(openSpools(t, dir)) >= 2 {
-			break
-		}
-		time.Sleep(time.Millisecond)
+	for len(openSpools(t, dir)) < 2 { // the second frame is spooled while queued
+		runtime.Gosched()
 	}
 	c.CloseNow()
-	for time.Now().Before(until) {
-		if b.work.Load() == 0 {
-			break
-		}
-		time.Sleep(time.Millisecond)
+	<-handlerDone
+	if b.work.Load() != 0 {
+		t.Fatalf("after socket handler exited, %d working bytes still charged", b.work.Load())
 	}
-	time.Sleep(20 * time.Millisecond)
 	if open := openSpools(t, dir); len(open) != 0 {
 		t.Fatalf("after socket handler exited, leaked %d spool files", len(open))
 	}

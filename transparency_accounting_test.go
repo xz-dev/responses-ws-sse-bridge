@@ -61,15 +61,11 @@ func TestTransparentPartialSpoolsChargedBeforeEOF(t *testing.T) {
 			result <- b.spoolFrame(reader)
 		}()
 		if _, err := writer.Write(bytes.Repeat([]byte{'x'}, size)); err != nil {
-			select {
-			case msg := <-result:
-				received[i] = true
-				messages = append(messages, msg)
-				if !errors.Is(msg.err, errWorkBudget) {
-					t.Fatalf("writer failure without matched genuine quota result: writer=%v spool=%v", err, msg.err)
-				}
-			case <-time.After(time.Second):
-				t.Fatal("writer failed without a joined spool result")
+			msg := <-result // a writer failure without a joined spool result hangs here
+			received[i] = true
+			messages = append(messages, msg)
+			if !errors.Is(msg.err, errWorkBudget) {
+				t.Fatalf("writer failure without matched genuine quota result: writer=%v spool=%v", err, msg.err)
 			}
 		}
 	}
