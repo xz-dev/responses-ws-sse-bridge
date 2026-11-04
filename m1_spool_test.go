@@ -2,13 +2,21 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
+
+	"github.com/coder/websocket"
 )
 
 // openSpools lists this process's open anonymous spool files in dir. An
@@ -117,6 +125,60 @@ func TestM1CheckSpoolDir(t *testing.T) {
 			if err := checkSpoolDir(shm); err == nil || !strings.Contains(err.Error(), "memory-backed") {
 				t.Fatalf("tmpfs accepted: %v", err)
 			}
+		}
+	}
+}
+
+// Deviation from tasks 2.1 (spool closed at turn end, ticket accounts the
+// whole turn): an upstream that answers with an error before reading the
+// body must not stall the turn. The turn ends with the explicit error event,
+// the spool is closed and the socket still carries the next turn.
+func TestM1UpstreamEarlyErrorDoesNotStallTurn(t *testing.T) {
+	var calls atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 { // answer without reading the 8 MiB body
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			io.WriteString(w, `{"error":{"message":"too big","type":"invalid_request_error","code":"request_too_large"}}`)
+			return
+		}
+		regressSSE(w, r)
+	}))
+	defer up.Close()
+	u, _ := url.Parse(up.URL)
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	bs := httptest.NewServer(newBridge(config{upstream: u, maxMsgBytes: 16 << 20, maxBodyBytes: 16 << 20, spoolDir: dir}))
+	defer bs.Close()
+	conn, _, err := websocket.Dial(context.Background(), wsURL(bs.URL)+"/v1/responses", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseNow()
+	conn.SetReadLimit(-1)
+	big := `{"type":"response.create","model":"m","input":"` + strings.Repeat("x", 8<<20) + `"}`
+	if err := conn.Write(context.Background(), websocket.MessageText, []byte(big)); err != nil {
+		t.Fatal(err)
+	}
+	_, ev, err := conn.Read(context.Background())
+	if err != nil || !bytes.Contains(ev, []byte(`"type":"error"`)) || !bytes.Contains(ev, []byte("request_too_large")) {
+		t.Fatalf("want explicit error event, got %s %v", ev, err)
+	}
+	for len(openSpools(t, dir)) != 0 { // a spool kept past the turn hangs here
+		runtime.Gosched()
+	}
+	if err := conn.Write(context.Background(), websocket.MessageText, []byte(`{"type":"response.create","model":"m","input":[]}`)); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		_, ev, err := conn.Read(context.Background())
+		if err != nil {
+			t.Fatalf("socket did not survive the error turn: %v", err)
+		}
+		if bytes.Contains(ev, []byte(`"response.completed"`)) {
+			return
 		}
 	}
 }
