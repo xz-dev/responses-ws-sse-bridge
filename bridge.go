@@ -31,15 +31,19 @@ type bridge struct {
 	cfg          config
 	client       *http.Client
 	proxy        *httputil.ReverseProxy
-	work         atomic.Int64 // bytes of resident frames currently charged
+	work         atomic.Int64 // memory bytes charged (windows, scans, metadata, sessions)
+	disk         atomic.Int64 // spool physical bytes charged
 	upstreamBase string
 }
 
 func newBridge(cfg config) *bridge {
 	if cfg.workBytes <= 0 {
-		// Default: two max-size frames plus two max-size events at the spool's
+		cfg.workBytes = defaultMemoryBudget
+	}
+	if cfg.diskBytes <= 0 {
+		// Two max-size frames plus two max-size events at the spool's
 		// conservative 2x physical charge — a budget, not a leak.
-		cfg.workBytes = 4*cfg.maxMsgBytes + 4*cfg.maxBodyBytes
+		cfg.diskBytes = 4*cfg.maxMsgBytes + 4*cfg.maxBodyBytes
 	}
 	tr := &http.Transport{
 		Proxy:               nil, // no proxy env: deterministic egress to the inner APISIX
@@ -312,15 +316,24 @@ func (b *bridge) sendErrorFrame(ctx context.Context, conn *websocket.Conn, e *ap
 	}
 }
 
-// acquire reserves n bytes of the global working budget; all-or-nothing.
-// Returns a release func, or nil when the budget is full.
-func (b *bridge) reserve(n int64) bool {
+// defaultMemoryBudget bounds the bytes this hop charges for in-process
+// buffers. With the Go GC's 2x heap overhead it stays below the 256m cgroup
+// limit minus the idle footprint and the 32 MiB margin (D3/D10).
+const defaultMemoryBudget = 64 << 20
+
+// reserve charges n bytes to the memory budget; all-or-nothing.
+func (b *bridge) reserve(n int64) bool { return reserveBudget(&b.work, b.cfg.workBytes, n) }
+
+// reserveDisk charges n spool physical bytes to the disk budget.
+func (b *bridge) reserveDisk(n int64) bool { return reserveBudget(&b.disk, b.cfg.diskBytes, n) }
+
+func reserveBudget(used *atomic.Int64, max, n int64) bool {
 	for {
-		cur := b.work.Load()
-		if n < 0 || n > b.cfg.workBytes-cur {
+		cur := used.Load()
+		if n < 0 || n > max-cur {
 			return false
 		}
-		if b.work.CompareAndSwap(cur, cur+n) {
+		if used.CompareAndSwap(cur, cur+n) {
 			return true
 		}
 	}
@@ -358,6 +371,9 @@ func (m *wsMsgLite) release() {
 	}
 	if m.lease != nil {
 		m.lease.release()
+	}
+	if m.disk != nil {
+		m.disk.release()
 	}
 }
 
@@ -428,7 +444,8 @@ type wsMsgLite struct {
 	badUTF bool
 	remote bool // err came from the socket, not a local refusal
 	err    error
-	lease  *requestLease
+	lease  *requestLease // memory: Go/FIFO metadata
+	disk   *requestLease // disk: the spool's physical bytes
 	next   *wsMsgLite
 }
 

@@ -6,7 +6,10 @@ import (
 	"sync"
 )
 
-var errWorkBudget = errors.New("request spool working-byte budget exhausted")
+var (
+	errWorkBudget = errors.New("memory budget exhausted")
+	errDiskBudget = errors.New("spool disk budget exhausted")
+)
 
 const (
 	requestReadBytes = 32 << 10
@@ -15,14 +18,21 @@ const (
 	requestMetadataBytes = 4096
 )
 
+// requestLease holds bytes of the memory budget, or of the disk budget
+// when disk is set.
 type requestLease struct {
 	bridge *bridge
 	bytes  int64
+	disk   bool
 	once   sync.Once
 }
 
 func (l *requestLease) grow(n int64) bool {
-	if !l.bridge.reserve(n) {
+	ok := l.bridge.reserve
+	if l.disk {
+		ok = l.bridge.reserveDisk
+	}
+	if !ok(n) {
 		return false
 	}
 	l.bytes += n
@@ -30,7 +40,13 @@ func (l *requestLease) grow(n int64) bool {
 }
 
 func (l *requestLease) release() {
-	l.once.Do(func() { l.bridge.work.Add(-l.bytes) })
+	l.once.Do(func() {
+		if l.disk {
+			l.bridge.disk.Add(-l.bytes)
+		} else {
+			l.bridge.work.Add(-l.bytes)
+		}
+	})
 }
 
 // requestFIFO holds only closed spools. Its nodes are charged to their spool

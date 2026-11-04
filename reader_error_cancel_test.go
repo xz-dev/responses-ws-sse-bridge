@@ -28,7 +28,7 @@ func TestTransparentReaderErrorCancelsBlockedWriter(t *testing.T) {
 	}))
 	t.Cleanup(up.Close)
 	u, _ := url.Parse(up.URL)
-	b := newBridge(config{upstream: u, maxMsgBytes: 4096, maxBodyBytes: 4096, workBytes: 1 << 20, spoolDir: t.TempDir()})
+	b := newBridge(config{upstream: u, maxMsgBytes: 4096, maxBodyBytes: 4096, workBytes: 1 << 20, diskBytes: 1 << 20, spoolDir: t.TempDir()})
 	gl := &gatedListener{Listener: mustListen(t)}
 	handlerDone := make(chan struct{})
 	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

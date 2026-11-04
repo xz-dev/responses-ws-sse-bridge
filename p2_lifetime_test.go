@@ -215,8 +215,8 @@ func TestSpoolRandomPhysicalAndMetadataAreDistinct(t *testing.T) {
 					t.Fatal(e)
 				}
 				actual := stat.Sys().(*syscall.Stat_t).Blocks * 512
-				if actual+requestMetadataBytes > b.work.Load() {
-					t.Fatalf("physical=%d + independent Go/FIFO=%d exceeds quota=%d at partial=%d", actual, requestMetadataBytes, b.work.Load(), end)
+				if actual > b.disk.Load() || requestMetadataBytes > b.work.Load() {
+					t.Fatalf("physical=%d disk=%d, Go/FIFO=%d memory=%d at partial=%d", actual, b.disk.Load(), requestMetadataBytes, b.work.Load(), end)
 				}
 				at = end
 			}

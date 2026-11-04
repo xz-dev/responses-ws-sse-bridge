@@ -97,7 +97,7 @@ func TestM1MidStreamRefusalIsResponseFailed(t *testing.T) {
 		w.(http.Flusher).Flush()
 		fmt.Fprintf(w, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"%s\"}\n\n", strings.Repeat("d", 2<<20))
 	}
-	p := startPair(t, up, func(c *config) { c.maxMsgBytes = 4096; c.maxBodyBytes = 4 << 20; c.workBytes = 1 << 20 })
+	p := startPair(t, up, func(c *config) { c.maxMsgBytes = 4096; c.maxBodyBytes = 4 << 20; c.diskBytes = 1 << 20 })
 	defer p.close()
 	conn := dial(t, p, "/v1/responses", nil)
 	defer conn.CloseNow()
@@ -111,7 +111,7 @@ func TestM1MidStreamRefusalIsResponseFailed(t *testing.T) {
 	}
 	resp, _ := ev["response"].(map[string]any)
 	errObj, _ := resp["error"].(map[string]any)
-	if errObj["code"] != "working_set_unavailable" || errObj["hop"] != bridgeHop || resp["id"] != "resp_a" {
+	if errObj["code"] != "spool_budget_exhausted" || errObj["hop"] != bridgeHop || resp["id"] != "resp_a" {
 		t.Fatalf("response.failed fields: %v", resp)
 	}
 	readCloseAfter(t, conn, websocket.StatusTryAgainLater)

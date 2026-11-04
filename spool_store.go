@@ -33,10 +33,17 @@ type chargedSpool struct {
 }
 
 func (b *bridge) newChargedSpool() (*chargedSpool, error) {
-	if !b.reserve(requestMetadataBytes + spoolPhysicalBase) {
+	if !b.reserve(requestMetadataBytes) {
 		return nil, errWorkBudget
 	}
-	s := &chargedSpool{reserve: b.cfg.diskReserveBytes, msg: wsMsgLite{lease: &requestLease{bridge: b, bytes: requestMetadataBytes + spoolPhysicalBase}}}
+	s := &chargedSpool{reserve: b.cfg.diskReserveBytes, msg: wsMsgLite{
+		lease: &requestLease{bridge: b, bytes: requestMetadataBytes},
+		disk:  &requestLease{bridge: b, disk: true},
+	}}
+	if !s.msg.disk.grow(spoolPhysicalBase) {
+		s.release()
+		return nil, errDiskBudget
+	}
 	dir := b.cfg.spoolDir
 	if dir == "" {
 		dir = os.TempDir()
@@ -77,8 +84,8 @@ func (s *chargedSpool) Write(p []byte) (int, error) {
 	// One block per record plus a separately reserved file base covers data
 	// extent metadata; the Go/FIFO metadata charge remains wholly independent.
 	physical := data + ((data+s.record-1)/s.record)*s.block
-	if !s.msg.lease.grow(physical - s.reserved) {
-		return 0, errWorkBudget
+	if !s.msg.disk.grow(physical - s.reserved) {
+		return 0, errDiskBudget
 	}
 	s.reserved = physical
 	if s.reserve > 0 {

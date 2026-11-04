@@ -36,7 +36,8 @@ type config struct {
 	upstream         *url.URL
 	maxMsgBytes      int64
 	maxBodyBytes     int64
-	workBytes        int64
+	workBytes        int64  // memory budget (WORK_MAX_BYTES)
+	diskBytes        int64  // spool disk budget (SPOOL_MAX_BYTES)
 	spoolDir         string // dir for request spools; "" = os.TempDir()
 	diskReserveBytes int64  // spool writes refuse below this much free disk (D3)
 	ledgerDir        string // read-only capacity ledger (D4); "" = gate off
@@ -75,8 +76,12 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
-	// 0 derives the budget from the limits in newBridge.
+	// 0 selects the defaults in newBridge: 64 MiB memory, 4x(cap+body) disk.
 	work, err := envInt64("WORK_MAX_BYTES", 0)
+	if err != nil {
+		return config{}, err
+	}
+	disk, err := envInt64("SPOOL_MAX_BYTES", 0)
 	if err != nil {
 		return config{}, err
 	}
@@ -84,7 +89,7 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
-	if msg <= 0 || body <= 0 || work < 0 || reserve < 0 {
+	if msg <= 0 || body <= 0 || work < 0 || disk < 0 || reserve < 0 {
 		return config{}, errors.New("limits must be positive")
 	}
 	spoolDir := os.Getenv("SPOOL_DIR")
@@ -106,6 +111,7 @@ func loadConfig() (config, error) {
 		listen: listenAddr(), upstream: u,
 		maxMsgBytes: msg, maxBodyBytes: body,
 		workBytes:        work,
+		diskBytes:        disk,
 		spoolDir:         spoolDir,
 		diskReserveBytes: reserve,
 		ledgerDir:        ledgerDir,

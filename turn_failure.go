@@ -28,7 +28,7 @@ var (
 // isLocalRefusal: a resource refusal by this hop, which the client must see
 // as an explicit error rather than a transport failure.
 func isLocalRefusal(err error) bool {
-	return errors.Is(err, errWorkBudget) || errors.Is(err, errInsufficientStorage)
+	return errors.Is(err, errWorkBudget) || errors.Is(err, errDiskBudget) || errors.Is(err, errInsufficientStorage)
 }
 
 func requestTooLarge(limit int64) *apiError {
@@ -44,7 +44,10 @@ func (b *bridge) failureAPIError(err error) *apiError {
 		return requestTooLarge(b.cfg.maxMsgBytes)
 	case errors.Is(err, errWorkBudget):
 		return &apiError{Status: http.StatusServiceUnavailable, Type: "server_error", Code: "working_set_unavailable", Hop: bridgeHop,
-			Message: fmt.Sprintf("Working capacity of %s (%d bytes) is exhausted; retry later.", bridgeHop, b.cfg.workBytes)}
+			Message: fmt.Sprintf("Memory budget of %s (%d bytes) is exhausted; retry later.", bridgeHop, b.cfg.workBytes)}
+	case errors.Is(err, errDiskBudget):
+		return &apiError{Status: http.StatusServiceUnavailable, Type: "server_error", Code: "spool_budget_exhausted", Hop: bridgeHop,
+			Message: fmt.Sprintf("Spool disk budget of %s (%d bytes) is exhausted; retry later.", bridgeHop, b.cfg.diskBytes)}
 	case errors.Is(err, errInsufficientStorage):
 		return &apiError{Status: http.StatusInsufficientStorage, Type: "server_error", Code: "insufficient_storage", Hop: bridgeHop,
 			Message: fmt.Sprintf("%s spool refused: free disk would fall below the %d-byte reserve.", bridgeHop, b.cfg.diskReserveBytes)}
@@ -62,7 +65,7 @@ func closeCodeFor(err error) (websocket.StatusCode, string) {
 	switch {
 	case errors.Is(err, errTooLarge):
 		return websocket.StatusNormalClosure, "request too large"
-	case errors.Is(err, errWorkBudget), errors.Is(err, errInsufficientStorage):
+	case errors.Is(err, errWorkBudget), errors.Is(err, errDiskBudget), errors.Is(err, errInsufficientStorage):
 		return websocket.StatusTryAgainLater, "capacity unavailable"
 	default:
 		return websocket.StatusInternalError, "turn failed"

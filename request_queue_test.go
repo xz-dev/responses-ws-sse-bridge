@@ -23,6 +23,9 @@ func assertRequestResourcesZero(t *testing.T, b *bridge) {
 	if got := b.work.Load(); got != 0 {
 		t.Fatalf("working bytes leaked: %d", got)
 	}
+	if got := b.disk.Load(); got != 0 {
+		t.Fatalf("spool disk bytes leaked: %d", got)
+	}
 	if open := openSpools(t, b.cfg.spoolDir); len(open) != 0 {
 		t.Fatalf("spool files leaked: %d open anonymous spools", len(open))
 	}
@@ -44,8 +47,8 @@ func TestRequestSpoolPositiveAndPhysicalCharge(t *testing.T) {
 		t.Fatal(err)
 	}
 	physical := stat.Sys().(*syscall.Stat_t).Blocks * 512
-	if b.work.Load() < physical+requestMetadataBytes {
-		t.Fatalf("physical blocks/metadata not charged: physical=%d quota=%d", physical, b.work.Load())
+	if b.disk.Load() < physical || b.work.Load() < requestMetadataBytes {
+		t.Fatalf("physical blocks/metadata not charged: physical=%d disk=%d memory=%d", physical, b.disk.Load(), b.work.Load())
 	}
 	msg.release()
 	assertRequestResourcesZero(t, b)
@@ -106,8 +109,9 @@ func TestRequestSpoolErrorsRelease(t *testing.T) {
 	}
 	msg.release()
 	assertRequestResourcesZero(t, b)
+	b.cfg.diskBytes = 16 << 10
 	msg = b.spoolFrame(bytes.NewReader(bytes.Repeat([]byte("q"), 32<<10)))
-	if !errors.Is(msg.err, errWorkBudget) {
+	if !errors.Is(msg.err, errDiskBudget) {
 		t.Fatalf("expected real quota failure, got %v", msg.err)
 	}
 	msg.release()
