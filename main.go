@@ -39,6 +39,8 @@ type config struct {
 	workBytes        int64
 	spoolDir         string // dir for request spools; "" = os.TempDir()
 	diskReserveBytes int64  // spool writes refuse below this much free disk (D3)
+	ledgerDir        string // read-only capacity ledger (D4); "" = gate off
+	cgroupDir        string // own cgroup v2 dir for headroom refusal; "" = off
 }
 
 func listenAddr() string {
@@ -93,12 +95,22 @@ func loadConfig() (config, error) {
 	if err := checkSpoolDir(spoolDir); err != nil {
 		return config{}, err
 	}
+	ledgerDir := os.Getenv("CAPACITY_LEDGER_DIR")
+	if ledgerDir != "" {
+		if st, err := os.Stat(ledgerDir); err != nil || !st.IsDir() {
+			return config{}, fmt.Errorf("CAPACITY_LEDGER_DIR %q is not a directory", ledgerDir)
+		}
+	} else {
+		log.Printf("CAPACITY_LEDGER_DIR unset: admission ticket leases are not enforced")
+	}
 	return config{
 		listen: listenAddr(), upstream: u,
 		maxMsgBytes: msg, maxBodyBytes: body,
 		workBytes:        work,
 		spoolDir:         spoolDir,
 		diskReserveBytes: reserve,
+		ledgerDir:        ledgerDir,
+		cgroupDir:        defaultCgroupDir(),
 	}, nil
 }
 

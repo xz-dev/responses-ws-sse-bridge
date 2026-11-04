@@ -54,6 +54,10 @@ func (b *bridge) failureAPIError(err error) *apiError {
 		return &apiError{Status: http.StatusServiceUnavailable, Type: "server_error", Code: "insufficient_memory", Hop: bridgeHop,
 			Message: fmt.Sprintf("%s cgroup memory headroom is below the required step plus the 32 MiB margin.", bridgeHop)}
 	default:
+		var ticket *ticketError
+		if errors.As(err, &ticket) {
+			return ticket.apiError()
+		}
 		return &apiError{Status: http.StatusInternalServerError, Type: "server_error", Code: "bridge_turn_failed", Hop: bridgeHop,
 			Message: fmt.Sprintf("%s failed the turn: %v", bridgeHop, err)}
 	}

@@ -811,8 +811,8 @@ func rewrittenBody(src io.ReaderAt, info frameInfo) (io.Reader, int64) {
 	sawStream := false
 	for _, m := range info.members {
 		switch m.key {
-		case "type", "generate", "previous_response_id":
-			continue // WS-mode-only; never reach HTTP
+		case "type", "generate", "previous_response_id", ticketMember:
+			continue // WS-mode-only (ticket travels as a header); never in the body
 		}
 		if m.key == "stream" && sawStream {
 			continue // dedupe: exactly one stream member

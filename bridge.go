@@ -85,6 +85,12 @@ func (b *bridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (b *bridge) serveNative(w http.ResponseWriter, r *http.Request) {
+	lease, err := b.admitTicket(r.ContentLength, r.Header.Get(ticketHeader))
+	if err != nil {
+		writeAPIError(w, b.failureAPIError(err))
+		return
+	}
+	defer lease.release() // held until the proxied exchange has finished
 	b.proxy.ServeHTTP(w, r)
 }
 
@@ -165,6 +171,7 @@ func (b *bridge) serveWS(w http.ResponseWriter, r *http.Request) {
 	conn.SetReadLimit(b.cfg.maxMsgBytes + 1)
 
 	headers := endToEndHeaders(r)
+	headers.Del(ticketHeader) // each turn's ticket comes from its own frame
 	path := r.URL.Path
 	if r.URL.RawQuery != "" {
 		path += "?" + r.URL.RawQuery
@@ -331,6 +338,9 @@ func (b *bridge) spoolFrame(frame io.Reader) (m wsMsgLite) {
 	if b.cfg.maxMsgBytes+1 < readBytes {
 		readBytes = b.cfg.maxMsgBytes + 1
 	}
+	if err := b.memHeadroom(turnMemStep); err != nil {
+		return wsMsgLite{err: err}
+	}
 	release := b.acquire(readBytes)
 	if release == nil {
 		return wsMsgLite{err: errWorkBudget}
@@ -459,6 +469,22 @@ func (b *bridge) handleTurnStream(ctx context.Context, conn *websocket.Conn, spo
 			}
 		}
 		return nil
+	}
+	ticket, err := frameTicket(spool, info)
+	if err != nil {
+		return err
+	}
+	lease, err := b.admitTicket(size, ticket)
+	if err != nil {
+		return err
+	}
+	if lease != nil {
+		// Close the spool before the shared lock drops (handler lifetime).
+		defer func() { _ = spool.Close(); lease.release() }()
+	}
+	if ticket != "" {
+		headers = headers.Clone()
+		headers.Set(ticketHeader, ticket)
 	}
 
 	// The POST body is a MultiReader of literal segments plus spool spans:
