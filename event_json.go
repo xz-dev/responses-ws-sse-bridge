@@ -248,19 +248,23 @@ func (b *bridge) writeEvent(ctx context.Context, conn *websocket.Conn, event *ch
 	}
 	defer release()
 	buf := make([]byte, eventWindowBytes)
-	writer, e := conn.Writer(ctx, websocket.MessageText)
-	if e != nil {
-		return e
-	}
+	// Failures before conn.Writer leave the socket free for an explicit
+	// failure event; once a message is open, only a close can follow.
+	var writer io.WriteCloser
 	if !flatError {
+		w, e := conn.Writer(ctx, websocket.MessageText)
+		if e != nil {
+			return fmt.Errorf("%w: %w", errMidMessage, e)
+		}
+		writer = w
 		if e := copyEventSpan(writer, event.file, 0, event.msg.size, buf); e != nil {
-			return e
+			return fmt.Errorf("%w: %w", errMidMessage, e)
 		}
 	} else {
 		fields := make(map[string]*eventMember)
 		var retained int64
 		defer func() { b.work.Add(-retained) }()
-		e = walkEventObject(event.file, 0, event.msg.size, func(m eventMember) error {
+		e := walkEventObject(event.file, 0, event.msg.size, func(m eventMember) error {
 			if m.key == "type" || m.key == "sequence_number" {
 				return nil
 			}
@@ -295,6 +299,23 @@ func (b *bridge) writeEvent(ctx context.Context, conn *websocket.Conn, event *ch
 		if e != nil {
 			return e
 		}
+		w, e := conn.Writer(ctx, websocket.MessageText)
+		if e != nil {
+			return fmt.Errorf("%w: %w", errMidMessage, e)
+		}
+		writer = w
+		if e := b.writeFlatError(writer, event, fields, buf); e != nil {
+			return fmt.Errorf("%w: %w", errMidMessage, e)
+		}
+	}
+	if e := writer.Close(); e != nil {
+		return fmt.Errorf("%w: %w", errMidMessage, e)
+	}
+	return nil
+}
+
+func (b *bridge) writeFlatError(writer io.Writer, event *chargedSpool, fields map[string]*eventMember, buf []byte) error {
+	{
 		if _, e := io.WriteString(writer, `{"type":"error","status":400,"error":{"type":"invalid_request_error"`); e != nil {
 			return e
 		}
@@ -322,7 +343,7 @@ func (b *bridge) writeEvent(ctx context.Context, conn *websocket.Conn, event *ch
 			return e
 		}
 	}
-	return writer.Close()
+	return nil
 }
 
 func (b *bridge) finishEventErr(ctx context.Context, conn *websocket.Conn, started, terminal bool, id string, sequence *int64, cause error, send func(context.Context, *websocket.Conn, *apiError)) error {
@@ -357,8 +378,8 @@ func (b *bridge) relaySpooledSSE(ctx context.Context, conn *websocket.Conn, body
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			if errors.Is(e, errWorkBudget) {
-				return e
+			if isLocalRefusal(e) {
+				return b.failStream(ctx, conn, started, responseID, &sequence, e)
 			}
 			cause := errUpstreamStream
 			if e == io.EOF {
@@ -369,14 +390,14 @@ func (b *bridge) relaySpooledSSE(ctx context.Context, conn *websocket.Conn, body
 		scanRelease := b.acquire(eventScanBytes)
 		if scanRelease == nil {
 			event.release()
-			return errWorkBudget
+			return b.failStream(ctx, conn, started, responseID, &sequence, errWorkBudget)
 		}
 		info, e := b.inspectEvent(event)
 		if e != nil {
 			scanRelease()
 			event.release()
-			if errors.Is(e, errWorkBudget) {
-				return e
+			if isLocalRefusal(e) {
+				return b.failStream(ctx, conn, started, responseID, &sequence, e)
 			}
 			return b.finishEventErr(ctx, conn, started, false, responseID, &sequence, errMalformedEvent, b.sendErrorFrame)
 		}
@@ -396,6 +417,9 @@ func (b *bridge) relaySpooledSSE(ctx context.Context, conn *websocket.Conn, body
 		scanRelease()
 		event.release()
 		if e != nil {
+			if isLocalRefusal(e) && !errors.Is(e, errMidMessage) {
+				return b.failStream(ctx, conn, started, responseID, &sequence, e)
+			}
 			return fmt.Errorf("ws event write: %w", e)
 		}
 		if info.done || info.typ == "error" {

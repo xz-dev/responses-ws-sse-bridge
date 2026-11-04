@@ -378,9 +378,9 @@ func TestClientCloseCancelsUpstream(t *testing.T) {
 	}
 }
 
-// RFC 6455 §7.4.1 + §5.2: an over-limit message must close the socket with
-// status 1009. The library enforces the read limit itself; verify the close
-// code reaches the client.
+// M1 (D9) supersedes the old library 1009: the library limit sits above the
+// cap and the bridge answers an over-limit message with an explicit
+// request_too_large event, then a coded close (see m1_errors_test.go).
 func TestOversizeFrame(t *testing.T) {
 	up := newSSEUpstream(t)
 	p := startPair(t, up, func(c *config) {
@@ -395,12 +395,13 @@ func TestOversizeFrame(t *testing.T) {
 	writeFrame(t, conn, big)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	_, _, err := conn.Read(ctx)
-	if err == nil {
-		t.Fatal("expected read limit error")
+	_, data, err := conn.Read(ctx)
+	if err != nil || !strings.Contains(string(data), `"code":"request_too_large"`) {
+		t.Fatalf("want request_too_large event: data=%s err=%v", data, err)
 	}
-	if websocket.CloseStatus(err) != websocket.StatusMessageTooBig {
-		t.Fatalf("close status: %v", err)
+	_, _, err = conn.Read(ctx)
+	if cs := websocket.CloseStatus(err); cs != websocket.StatusNormalClosure {
+		t.Fatalf("close status %v: %v", cs, err)
 	}
 	up.mu.Lock()
 	defer up.mu.Unlock()

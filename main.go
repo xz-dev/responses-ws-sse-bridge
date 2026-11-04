@@ -32,12 +32,13 @@ import (
 )
 
 type config struct {
-	listen       string
-	upstream     *url.URL
-	maxMsgBytes  int64
-	maxBodyBytes int64
-	workBytes    int64
-	spoolDir     string // dir for request spools; "" = os.TempDir()
+	listen           string
+	upstream         *url.URL
+	maxMsgBytes      int64
+	maxBodyBytes     int64
+	workBytes        int64
+	spoolDir         string // dir for request spools; "" = os.TempDir()
+	diskReserveBytes int64  // spool writes refuse below this much free disk (D3)
 }
 
 func listenAddr() string {

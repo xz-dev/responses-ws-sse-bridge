@@ -237,7 +237,12 @@ func TestRegressionUTF8Requires1007(t *testing.T) {
 	regressSend(t, c, []byte{'{', '"', 'x', '"', ':', '"', 0xff, '"', '}'})
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
+	// M1 (D9): an explicit error event precedes the 1007 close.
 	_, b, err := c.Read(ctx)
+	if err != nil || !strings.Contains(string(b), `"code":"invalid_utf8"`) {
+		t.Fatalf("want invalid_utf8 error event first; got data=%s err=%v", b, err)
+	}
+	_, b, err = c.Read(ctx)
 	if websocket.CloseStatus(err) != websocket.StatusInvalidFramePayloadData {
 		t.Fatalf("want close 1007; got data=%s err=%v close=%v", b, err, websocket.CloseStatus(err))
 	}

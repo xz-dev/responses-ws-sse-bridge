@@ -141,8 +141,37 @@ func testUpstreamEventCapacity(t *testing.T, budget int64) {
 	gl.mu.Unlock()
 	select {
 	case <-gate.entered:
-		if charged := b.work.Load(); charged < 1<<20 {
-			t.Fatalf("held a real 1MiB upstream event at transport Write with only %d bytes charged against budget=%d", charged, b.cfg.workBytes)
+		if charged := b.work.Load(); charged >= 1<<20 {
+			break // the real event is held fully charged
+		}
+		// M1 (D9): a capacity refusal is now an explicit frame, so the first
+		// gated write must be that refusal, never an uncharged 1MiB event.
+		gl.releaseAll()
+		_, data, err := conn.Read(ctx)
+		if err != nil {
+			t.Fatalf("refusal frame not delivered: %v", err)
+		}
+		if !strings.Contains(string(data), `"code":"working_set_unavailable"`) || !strings.Contains(string(data), bridgeHop) {
+			t.Fatalf("gated write was neither a charged event nor an explicit refusal: %.200s", data)
+		}
+		if budget == 64<<10 {
+			select {
+			case <-upStarted:
+				t.Fatal("64KiB pressure must fail before handing off a 64KiB upload lease")
+			default:
+			}
+		}
+		// Complete the coded close handshake the refusal started.
+		if _, _, err := conn.Read(ctx); websocket.CloseStatus(err) != websocket.StatusTryAgainLater {
+			t.Fatalf("refusal close: %v", err)
+		}
+		select {
+		case <-handlerDone:
+		case <-ctx.Done():
+			t.Fatal("capacity refusal did not join handler")
+		}
+		if b.work.Load() != 0 {
+			t.Fatalf("capacity refusal leaked %d bytes", b.work.Load())
 		}
 	case <-gate.closed:
 		if budget == 64<<10 {

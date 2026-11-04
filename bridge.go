@@ -108,6 +108,7 @@ type apiError struct {
 	Type    string `json:"type"`
 	Code    string `json:"code,omitempty"`
 	Param   string `json:"param,omitempty"`
+	Hop     string `json:"hop,omitempty"`
 	Message string `json:"message"`
 }
 
@@ -158,7 +159,9 @@ func (b *bridge) serveWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.CloseNow()
-	conn.SetReadLimit(b.cfg.maxMsgBytes)
+	// Library limit sits above the cap: spoolFrame reads at most cap+1 bytes
+	// and answers over-limit messages itself with an error event (D9).
+	conn.SetReadLimit(b.cfg.maxMsgBytes + 1)
 
 	headers := endToEndHeaders(r)
 	path := r.URL.Path
@@ -179,7 +182,12 @@ func (b *bridge) serveWS(w http.ResponseWriter, r *http.Request) {
 	readerDone := make(chan struct{})
 	go func() {
 		defer close(readerDone)
-		defer dead()
+		handedOff := false
+		defer func() {
+			if !handedOff {
+				dead()
+			}
+		}()
 		for {
 			typ, reader, err := conn.Reader(context.Background())
 			if err != nil {
@@ -188,13 +196,15 @@ func (b *bridge) serveWS(w http.ResponseWriter, r *http.Request) {
 			msg := b.spoolFrame(reader)
 			msg.typ = typ
 			if msg.err != nil {
-				// Preserve RFC 6455 size rejection; this is a protocol close,
-				// never an application/error-frame write by the reader.
-				if errors.Is(msg.err, errTooLarge) {
-					_ = conn.Close(websocket.StatusMessageTooBig, "message too big")
-				}
-				// Real resource/IO failure cannot wait behind a blocked writer.
 				msg.release()
+				if msg.remote {
+					return // the socket itself broke mid-message
+				}
+				// A local refusal (over-limit, budget, disk) is answered by the
+				// worker in FIFO order with an error event, then a close. The
+				// reader never writes application frames and stops reading.
+				failure := &wsMsgLite{err: msg.err}
+				handedOff = incoming.push(failure)
 				return
 			}
 			if !incoming.push(&msg) {
@@ -215,6 +225,10 @@ func (b *bridge) serveWS(w http.ResponseWriter, r *http.Request) {
 		if !have {
 			return
 		}
+		if msg.err != nil {
+			b.failTurn(ctx, conn, msg.err)
+			return
+		}
 
 		turnCtx, stopTurn := context.WithCancel(ctx)
 		if msg.typ != websocket.MessageText {
@@ -226,7 +240,8 @@ func (b *bridge) serveWS(w http.ResponseWriter, r *http.Request) {
 		if msg.badUTF {
 			msg.release()
 			stopTurn()
-			conn.Close(websocket.StatusInvalidFramePayloadData, "invalid utf-8")
+			b.sendErrorFrame(ctx, conn, &apiError{Status: http.StatusBadRequest, Type: "invalid_request_error", Code: "invalid_utf8", Hop: bridgeHop, Message: "WebSocket text frame is not valid UTF-8"})
+			_ = conn.Close(websocket.StatusInvalidFramePayloadData, "invalid utf-8")
 			return
 		}
 		spool, err := os.Open(msg.name)
@@ -237,10 +252,10 @@ func (b *bridge) serveWS(w http.ResponseWriter, r *http.Request) {
 		msg.release()
 		stopTurn()
 		if err != nil {
-			if errors.Is(err, errWorkBudget) {
-				return
+			if ctx.Err() != nil {
+				return // the client socket is gone; nothing can be delivered
 			}
-			conn.Close(websocket.StatusInternalError, "turn failed")
+			b.failTurn(ctx, conn, err)
 			return
 		}
 	}
@@ -260,6 +275,9 @@ func (b *bridge) sendErrorFrame(ctx context.Context, conn *websocket.Conn, e *ap
 	}
 	if e.Param != "" {
 		errObj["param"] = e.Param
+	}
+	if e.Hop != "" {
+		errObj["hop"] = e.Hop
 	}
 	frame := map[string]any{"type": "error", "error": errObj}
 	if e.Status != 0 {
@@ -359,7 +377,7 @@ func (b *bridge) spoolFrame(frame io.Reader) (m wsMsgLite) {
 		if rerr != nil {
 			m = spool.msg
 			if rerr != io.EOF {
-				m.err = rerr
+				m.err, m.remote = rerr, true
 			}
 			m.badUTF = !uv.valid()
 			return
@@ -374,6 +392,7 @@ type wsMsgLite struct {
 	name   string
 	size   int64
 	badUTF bool
+	remote bool // err came from the socket, not a local refusal
 	err    error
 	lease  *requestLease
 	next   *wsMsgLite
