@@ -42,7 +42,7 @@ func TestM1TicketStrippedForwardedAndLocked(t *testing.T) {
 	defer p.close()
 	conn := dial(t, p, "/v1/responses", http.Header{ticketHeader: {"ffffffffffffffffffffffffffffffff"}})
 	defer conn.CloseNow()
-	writeFrame(t, conn, `{"type":"response.create","model":"m","`+ticketMember+`":"`+testTicket+`","input":[]}`)
+	writeFrame(t, conn, `{"`+ticketMember+`":"`+testTicket+`","type":"response.create","model":"m","input":[]}`)
 	for _, want := range []string{"response.created", "response.output_text.delta", "response.completed"} {
 		if got := readEvent(t, conn)["type"]; got != want {
 			t.Fatalf("got %v want %s", got, want)

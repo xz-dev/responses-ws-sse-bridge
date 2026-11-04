@@ -20,6 +20,9 @@ const (
 	ticketMember    = "ai_gateway_capacity_ticket"
 	ticketThreshold = 64 << 20 // bodies at or above this size need a ticket
 	ticketIDLen     = 32       // 128-bit id, lowercase hex; the file name in the ledger
+	// ticketPrefixBytes bounds the in-memory frame prefix that must hold the
+	// ticket member, which keeper writes first: {"ai_gateway_capacity_ticket":"<id>".
+	ticketPrefixBytes = 512
 )
 
 type ticketError struct {
@@ -62,14 +65,18 @@ func validTicketID(id string) bool {
 }
 
 // admitTicket returns the lease this hop must hold for a request of size
-// bytes carrying id. With no ledger configured the gate is off (nil, nil).
+// bytes carrying id; nil for a small request it cannot or need not lease.
+// It fails closed: with no ledger configured, 64 MiB or more is refused.
 func (b *bridge) admitTicket(size int64, id string) (*ticketLease, error) {
-	if b.cfg.ledgerDir == "" {
-		return nil, nil
-	}
 	if id == "" {
 		if size >= ticketThreshold {
 			return nil, ticketMissing(size)
+		}
+		return nil, nil
+	}
+	if b.cfg.ledgerDir == "" {
+		if size >= ticketThreshold {
+			return nil, ticketInvalid("CAPACITY_LEDGER_DIR is not configured, so the ticket cannot be leased")
 		}
 		return nil, nil
 	}
@@ -124,4 +131,43 @@ func frameTicket(src io.ReaderAt, info frameInfo) (string, error) {
 		}
 	}
 	return id, nil
+}
+
+// prefixTicket returns the ticket id when the frame's first member is the
+// ticket member, or "" when the first member is another key. The member
+// must be complete inside the prefix unless the frame ended (eof).
+func prefixTicket(p []byte, eof bool) (string, error) {
+	i := 0
+	ws := func() {
+		for i < len(p) && (p[i] == ' ' || p[i] == '\t' || p[i] == '\n' || p[i] == '\r') {
+			i++
+		}
+	}
+	lit := func(s string) bool {
+		if len(p)-i < len(s) || string(p[i:i+len(s)]) != s {
+			return false
+		}
+		i += len(s)
+		return true
+	}
+	ws()
+	if !lit("{") {
+		return "", nil // not an object: the frame scan refuses it
+	}
+	ws()
+	if !lit(`"` + ticketMember + `"`) {
+		if eof || len(p)-i >= len(ticketMember)+2 {
+			return "", nil
+		}
+		return "", ticketInvalid("frame prefix too short to hold the ticket member")
+	}
+	ws()
+	if !lit(":") {
+		return "", ticketInvalid("ticket member is not followed by a value in the frame prefix")
+	}
+	ws()
+	if !lit(`"`) || len(p)-i < ticketIDLen+1 || p[i+ticketIDLen] != '"' || !validTicketID(string(p[i:i+ticketIDLen])) {
+		return "", ticketInvalid("ticket member is not a ticket id")
+	}
+	return string(p[i : i+ticketIDLen]), nil
 }

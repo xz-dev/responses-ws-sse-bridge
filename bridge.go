@@ -280,7 +280,7 @@ func (b *bridge) serveWS(w http.ResponseWriter, r *http.Request) {
 			_ = conn.Close(websocket.StatusInvalidFramePayloadData, "invalid utf-8")
 			return
 		}
-		err := b.handleTurnStream(turnCtx, conn, msg.file, msg.size, headers, path)
+		err := b.handleTurnStream(turnCtx, conn, msg.file, msg.size, msg.ticketID, headers, path)
 		msg.release()
 		stopTurn()
 		if err != nil {
@@ -408,11 +408,13 @@ func (m *wsMsgLite) release() {
 	if m.disk != nil {
 		m.disk.release()
 	}
+	m.ticket.release()
 }
 
 // spoolFrame charges fixed read storage before allocating it and allocated
 // file blocks before writing. Admission is nonblocking: no lease waits for
-// more capacity while retaining prior spool data.
+// more capacity while retaining prior spool data. The one blocking wait is
+// the ticket's LOCK_SH, taken before any frame byte is spooled (D4).
 func (b *bridge) spoolFrame(frame io.Reader) (m wsMsgLite) {
 	readBytes := int64(requestReadBytes)
 	if b.cfg.maxMsgBytes+1 < readBytes {
@@ -423,10 +425,27 @@ func (b *bridge) spoolFrame(frame io.Reader) (m wsMsgLite) {
 		return wsMsgLite{err: errWorkBudget}
 	}
 	defer release()
-	spool, err := b.newChargedSpool()
+	buf := make([]byte, int(readBytes))
+	// Keeper writes the ticket as the frame's first member, so it is read
+	// from a bounded in-memory prefix and leased before the spool exists.
+	n, rerr := readPrefix(frame, buf[:min(ticketPrefixBytes, len(buf))])
+	if rerr != nil && rerr != io.EOF {
+		return wsMsgLite{err: rerr, remote: true}
+	}
+	id, err := prefixTicket(buf[:n], rerr == io.EOF)
+	var lease *ticketLease
+	if err == nil {
+		lease, err = b.admitTicket(0, id)
+	}
 	if err != nil {
 		return wsMsgLite{err: err}
 	}
+	spool, err := b.newChargedSpool()
+	if err != nil {
+		lease.release()
+		return wsMsgLite{err: err}
+	}
+	spool.msg.ticket, spool.msg.ticketID = lease, id
 	defer func() {
 		// On success the open anonymous file is handed to the worker in m.
 		if m.err != nil {
@@ -434,28 +453,34 @@ func (b *bridge) spoolFrame(frame io.Reader) (m wsMsgLite) {
 			m.file = nil
 		}
 	}()
-	buf := make([]byte, int(readBytes))
 	var uv utf8Validator
 	for {
-		limit := b.cfg.maxMsgBytes + 1 - spool.msg.size
-		if limit <= 0 {
-			m.err = errTooLarge
-			return
-		}
-		if limit > int64(len(buf)) {
-			limit = int64(len(buf))
-		}
-		n, rerr := frame.Read(buf[:limit])
-		if n > 0 {
-			if spool.msg.size+int64(n) > b.cfg.maxMsgBytes {
+		if n == 0 && rerr == nil {
+			limit := b.cfg.maxMsgBytes + 1 - spool.msg.size
+			if limit <= 0 {
 				m.err = errTooLarge
 				return
+			}
+			n, rerr = frame.Read(buf[:min(limit, int64(len(buf)))])
+		}
+		if n > 0 {
+			size := spool.msg.size + int64(n)
+			if size > b.cfg.maxMsgBytes {
+				m.err = errTooLarge
+				return
+			}
+			if lease == nil && size >= ticketThreshold {
+				// Refused as the frame crosses 64 MiB, not after spooling it.
+				if _, m.err = b.admitTicket(size, id); m.err != nil {
+					return
+				}
 			}
 			_, _ = uv.Write(buf[:n])
 			if _, err := spool.Write(buf[:n]); err != nil {
 				m.err = err
 				return
 			}
+			n = 0
 		}
 		if rerr != nil {
 			m = spool.msg
@@ -466,6 +491,19 @@ func (b *bridge) spoolFrame(frame io.Reader) (m wsMsgLite) {
 			return
 		}
 	}
+}
+
+// readPrefix fills p from r unless r ends or fails first.
+func readPrefix(r io.Reader, p []byte) (int, error) {
+	n := 0
+	for n < len(p) {
+		k, err := r.Read(p[n:])
+		n += k
+		if err != nil {
+			return n, err
+		}
+	}
+	return n, nil
 }
 
 // wsMsgLite is the reader→worker handoff. Each queued create holds its open
@@ -479,7 +517,11 @@ type wsMsgLite struct {
 	err    error
 	lease  *requestLease // memory: Go/FIFO metadata
 	disk   *requestLease // disk: the spool's physical bytes
-	next   *wsMsgLite
+	// ticket is the D4 lease, taken before the first spooled byte and
+	// dropped after the spool closes; ticketID came from the frame prefix.
+	ticket   *ticketLease
+	ticketID string
+	next     *wsMsgLite
 }
 
 // handleTurnStream validates the spooled frame's JSON in one streaming
@@ -488,7 +530,7 @@ type wsMsgLite struct {
 // RAM: validation reads it once from disk, and the POST body is an
 // io.MultiReader of "key": literals plus SectionReader value spans — a
 // turn's reader-owned spool lease remains charged through validation and POST.
-func (b *bridge) handleTurnStream(ctx context.Context, conn *websocket.Conn, spool *os.File, size int64, headers http.Header, path string) error {
+func (b *bridge) handleTurnStream(ctx context.Context, conn *websocket.Conn, spool *os.File, size int64, leasedID string, headers http.Header, path string) error {
 	if spool == nil {
 		b.sendErrorFrame(ctx, conn, &apiError{Status: http.StatusBadRequest, Type: "invalid_request_error", Message: "could not read frame"})
 		return nil
@@ -548,17 +590,14 @@ func (b *bridge) handleTurnStream(ctx context.Context, conn *websocket.Conn, spo
 		}
 		return nil
 	}
+	// The reader leased the ticket from the frame prefix; the full scan must
+	// agree, so a ticket that is not the first member is refused.
 	ticket, err := frameTicket(spool, info)
 	if err != nil {
 		return err
 	}
-	lease, err := b.admitTicket(size, ticket)
-	if err != nil {
-		return err
-	}
-	if lease != nil {
-		// Close the spool before the shared lock drops (handler lifetime).
-		defer func() { _ = spool.Close(); lease.release() }()
+	if ticket != leasedID {
+		return ticketInvalid("the ticket member must be the first member of the frame")
 	}
 	if ticket != "" {
 		headers = headers.Clone()
