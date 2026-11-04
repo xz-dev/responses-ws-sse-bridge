@@ -676,7 +676,7 @@ func (b *bridge) runUpstream(ctx context.Context, conn *websocket.Conn, body io.
 		if ctx.Err() != nil {
 			return err
 		}
-		b.sendErrorFrame(ctx, conn, &apiError{Status: http.StatusBadGateway, Type: "upstream_error", Message: "upstream request failed"})
+		b.sendErrorFrame(ctx, conn, &apiError{Status: http.StatusBadGateway, Type: "upstream_error", Code: "upstream_request_failed", Hop: bridgeHop, Message: "upstream request failed"})
 		return nil
 	}
 	defer resp.Body.Close()

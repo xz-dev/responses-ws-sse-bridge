@@ -119,3 +119,16 @@ func TestM1MidStreamRefusalIsResponseFailed(t *testing.T) {
 	}
 	readCloseAfter(t, conn, websocket.StatusTryAgainLater)
 }
+
+// An upstream that cannot be reached before SSE starts is an explicit error
+// event naming this hop; the socket stays usable.
+func TestM1UpstreamUnreachableIsExplicit(t *testing.T) {
+	up := newSSEUpstream(t)
+	p := startPair(t, up, nil)
+	defer p.close()
+	p.uSrv.Close()
+	conn := dial(t, p, "/v1/responses", nil)
+	defer conn.CloseNow()
+	writeFrame(t, conn, `{"type":"response.create","model":"m","input":[]}`)
+	requireErrorEvent(t, readEvent(t, conn), "upstream_request_failed")
+}
