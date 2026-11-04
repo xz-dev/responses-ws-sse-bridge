@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -58,9 +59,8 @@ func TestSpooledLargeEventAndLongTurnReleaseEachEvent(t *testing.T) {
 		t.Fatalf("long turn ended prematurely: %v %s", e, data)
 	}
 	_ = conn.CloseNow()
-	until := time.Now().Add(time.Second)
-	for b.work.Load() != 0 && time.Now().Before(until) {
-		time.Sleep(time.Millisecond)
+	for b.work.Load() != 0 { // a leaked charge hangs here
+		runtime.Gosched()
 	}
 	assertRequestResourcesZero(t, b)
 }
