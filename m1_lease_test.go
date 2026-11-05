@@ -39,7 +39,7 @@ func ticketFrame(id string) string {
 func TestM1QueuedTicketedTurnLeasedUntilFreed(t *testing.T) {
 	const tb = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	ledger := t.TempDir()
-	pathB := filepath.Join(ledger, tb)
+	pathB := filepath.Join(ledger, tb+ticketSuffix)
 	if err := os.WriteFile(pathB, nil, 0o640); err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +107,7 @@ func rawDial(t *testing.T, p *pair) (net.Conn, *bufio.Reader) {
 // frame byte. While keeper holds LOCK_EX the frame is not spooled at all.
 func TestM1TicketLeasedBeforeSpooling(t *testing.T) {
 	ledger := ledgerWithTicket(t)
-	path := filepath.Join(ledger, testTicket)
+	path := filepath.Join(ledger, testTicket+ticketSuffix)
 	keeper, _ := os.Open(path)
 	defer keeper.Close()
 	if err := syscall.Flock(int(keeper.Fd()), syscall.LOCK_EX); err != nil {

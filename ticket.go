@@ -18,8 +18,9 @@ import (
 const (
 	ticketHeader    = "X-AI-Gateway-Capacity-Ticket"
 	ticketMember    = "ai_gateway_capacity_ticket"
-	ticketThreshold = 64 << 20 // bodies at or above this size need a ticket
-	ticketIDLen     = 32       // 128-bit id, lowercase hex; the file name in the ledger
+	ticketThreshold = 64 << 20  // bodies at or above this size need a ticket
+	ticketIDLen     = 32        // 128-bit id, lowercase hex
+	ticketSuffix    = ".ticket" // the ledger file is <id>.ticket (D4, keeper gate.go)
 	// ticketPrefixBytes bounds the in-memory frame prefix that must hold the
 	// ticket member, which keeper writes first: {"ai_gateway_capacity_ticket":"<id>".
 	ticketPrefixBytes = 512
@@ -83,7 +84,7 @@ func (b *bridge) admitTicket(size int64, id string) (*ticketLease, error) {
 	if !validTicketID(id) {
 		return nil, ticketInvalid("malformed id")
 	}
-	f, err := os.Open(filepath.Join(b.cfg.ledgerDir, id)) // O_RDONLY|O_CLOEXEC
+	f, err := os.Open(filepath.Join(b.cfg.ledgerDir, id+ticketSuffix)) // O_RDONLY|O_CLOEXEC
 	if err != nil {
 		return nil, ticketInvalid("cannot open ticket")
 	}

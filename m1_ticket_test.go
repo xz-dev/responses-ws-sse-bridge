@@ -17,7 +17,7 @@ const testTicket = "0123456789abcdef0123456789abcdef"
 func ledgerWithTicket(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, testTicket), nil, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, testTicket+ticketSuffix), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	return dir
@@ -30,7 +30,7 @@ func TestM1TicketStrippedForwardedAndLocked(t *testing.T) {
 	locked := make(chan bool, 1)
 	up := newSSEUpstream(t)
 	up.sse = func(w http.ResponseWriter, r *http.Request) {
-		f, err := os.Open(filepath.Join(ledger, testTicket))
+		f, err := os.Open(filepath.Join(ledger, testTicket+ticketSuffix))
 		if err == nil {
 			// Keeper's release waiter takes LOCK_EX; it must not succeed now.
 			locked <- syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) != nil
@@ -62,7 +62,7 @@ func TestM1TicketStrippedForwardedAndLocked(t *testing.T) {
 	}
 	// After the turn the lock is dropped, so keeper's blocking LOCK_EX is
 	// granted (a leaked lease hangs here until the go test timeout).
-	f, _ := os.Open(filepath.Join(ledger, testTicket))
+	f, _ := os.Open(filepath.Join(ledger, testTicket+ticketSuffix))
 	defer f.Close()
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
 		t.Fatal(err)
@@ -104,7 +104,7 @@ func TestM1TicketMissingAndReleased(t *testing.T) {
 	if _, err := b.admitTicket(1, "../etc/passwd"); err == nil {
 		t.Fatal("path-like ticket accepted")
 	}
-	if err := os.Remove(filepath.Join(ledger, testTicket)); err != nil {
+	if err := os.Remove(filepath.Join(ledger, testTicket+ticketSuffix)); err != nil {
 		t.Fatal(err)
 	}
 	_, err = b.admitTicket(ticketThreshold, testTicket)
@@ -118,7 +118,7 @@ func TestM1TicketUnlinkedWhileWaiting(t *testing.T) {
 	ledger := ledgerWithTicket(t)
 	b := requestTestBridge(t, 1<<20)
 	b.cfg.ledgerDir = ledger
-	path := filepath.Join(ledger, testTicket)
+	path := filepath.Join(ledger, testTicket+ticketSuffix)
 	keeper, _ := os.Open(path)
 	defer keeper.Close()
 	if err := syscall.Flock(int(keeper.Fd()), syscall.LOCK_EX); err != nil {
@@ -133,5 +133,50 @@ func TestM1TicketUnlinkedWhileWaiting(t *testing.T) {
 	_ = syscall.Flock(int(keeper.Fd()), syscall.LOCK_UN)
 	if err := <-done; err == nil || !strings.Contains(err.Error(), "already released") {
 		t.Fatalf("want released refusal, got %v", err)
+	}
+}
+
+// D4 contract: the lease opens <ledger>/<id>.ticket, never the bare id.
+func TestM1TicketOpensDotTicketFile(t *testing.T) {
+	ledger := t.TempDir()
+	b := requestTestBridge(t, 1<<20)
+	b.cfg.ledgerDir = ledger
+	if err := os.WriteFile(filepath.Join(ledger, testTicket), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := b.admitTicket(ticketThreshold, testTicket)
+	if e := b.failureAPIError(err); e.Code != "capacity_ticket_invalid" {
+		t.Fatalf("bare-id file leased: %+v", e)
+	}
+	if err := os.WriteFile(filepath.Join(ledger, testTicket+ticketSuffix), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	l, err := b.admitTicket(ticketThreshold, testTicket)
+	if err != nil || l == nil {
+		t.Fatalf("%s not leased: %v", testTicket+ticketSuffix, err)
+	}
+	l.release()
+}
+
+// A malformed or path-like id is refused with capacity_ticket_invalid before
+// any path is built, even when the traversal target exists.
+func TestM1TicketMalformedIDRefused(t *testing.T) {
+	root := t.TempDir()
+	ledger := filepath.Join(root, "ledger")
+	if err := os.Mkdir(ledger, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"x", testTicket[:29]} { // targets of the "../" ids below
+		if err := os.WriteFile(filepath.Join(root, name+ticketSuffix), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b := requestTestBridge(t, 1<<20)
+	b.cfg.ledgerDir = ledger
+	for _, id := range []string{"../x", "../" + testTicket[:29], testTicket[:31], testTicket + "0", "0123456789ABCDEF0123456789abcdef", testTicket[:30] + "/x", testTicket[:31] + "\x00"} {
+		l, err := b.admitTicket(ticketThreshold, id)
+		if e := b.failureAPIError(err); l != nil || e.Code != "capacity_ticket_invalid" {
+			t.Fatalf("id %q: lease %v, error %+v", id, l, e)
+		}
 	}
 }
