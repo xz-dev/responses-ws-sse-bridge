@@ -71,7 +71,7 @@ for the tested Sub2API passthrough and owner-gate incompatibilities.
 | `UPSTREAM_URL` | *(required)* | Sub2API base URL, `http(s)`, no query/userinfo |
 | `LISTEN_ADDR` | `:8080` | Listen address |
 | `PORT` | *(unset)* | Optional healthcheck-only override: probe `127.0.0.1:$PORT` instead of `LISTEN_ADDR`. Does not change the server listener. |
-| `MAX_MESSAGE_BYTES` | `268435456` | Max incoming WS message bytes, counted by the bridge after reassembly and inflation (`request_too_large` with `limit`) |
+| `MAX_MESSAGE_BYTES` | `268435456` | Max incoming WS message bytes, counted by the bridge after reassembly and inflation (`request_too_large` with `limit_bytes`) |
 | `MAX_BODY_BYTES` | `268435456` | Per-event bound: max bytes of one upstream error body or one SSE event |
 | `WORK_MAX_BYTES` | `67108864` | Memory budget: session state, queue metadata, read/scan/upload/event windows and the inflater. Exhaustion: 503 `working_set_unavailable` |
 | `SPOOL_MAX_BYTES` | `4 × (MAX_MESSAGE_BYTES + MAX_BODY_BYTES)` | Spool disk budget: physical bytes of request and event spools. Exhaustion: 503 `spool_budget_exhausted` |

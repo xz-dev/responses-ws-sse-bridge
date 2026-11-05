@@ -168,7 +168,7 @@ type apiError struct {
 	Code    string `json:"code,omitempty"`
 	Param   string `json:"param,omitempty"`
 	Hop     string `json:"hop,omitempty"`
-	Limit   int64  `json:"limit,omitempty"` // the byte limit a size refusal names
+	Limit   int64  `json:"limit_bytes,omitempty"` // the byte limit a size refusal names
 	Message string `json:"message"`
 }
 
@@ -377,7 +377,7 @@ func (b *bridge) sendErrorFrame(ctx context.Context, conn *websocket.Conn, e *ap
 		errObj["hop"] = e.Hop
 	}
 	if e.Limit != 0 {
-		errObj["limit"] = e.Limit
+		errObj["limit_bytes"] = e.Limit
 	}
 	frame := map[string]any{"type": "error", "error": errObj}
 	if e.Status != 0 {

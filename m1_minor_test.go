@@ -44,8 +44,8 @@ func TestM1LocalEventsCarryCodeHopLimit(t *testing.T) {
 	writeFrame(t, conn, `{"type":"session.update"}`)
 	requireErrorEvent(t, readEvent(t, conn), "unsupported_event_type")
 	writeFrame(t, conn, `{"type":"response.create","input":"`+strings.Repeat("x", 64)+`"}`)
-	if e := requireErrorEvent(t, readEvent(t, conn), "request_too_large"); e["limit"] != float64(64) {
-		t.Fatalf("limit field = %v", e["limit"])
+	if e := requireErrorEvent(t, readEvent(t, conn), "request_too_large"); e["limit_bytes"] != float64(64) || e["limit"] != nil {
+		t.Fatalf("limit_bytes = %v, legacy limit = %v", e["limit_bytes"], e["limit"])
 	}
 }
 
