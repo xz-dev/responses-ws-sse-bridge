@@ -118,8 +118,8 @@ func (g *unticketedBody) refusal() error {
 
 func (b *bridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if isUpgradeRequest(r) {
-		if r.URL.Path != "/v1/responses" && r.URL.Path != "/responses" {
-			// Outside the Responses paths the selector handles upgrades itself;
+		if !convertedWSPath(r.URL.Path) {
+			// Outside the Responses paths the upstream handles upgrades itself;
 			// tunnel them through unchanged.
 			b.serveNative(w, r)
 			return
@@ -144,6 +144,17 @@ func (b *bridge) serveNative(w http.ResponseWriter, r *http.Request) {
 		r.Body = g
 	}
 	b.proxy.ServeHTTP(w, r)
+}
+
+// convertedWSPath reports whether a WS upgrade on path is terminated here and
+// each turn converted to an HTTP POST on the same path. The upstream serves
+// POST on each of these paths; its own WS ingress has a lower message cap.
+func convertedWSPath(path string) bool {
+	switch path {
+	case "/v1/responses", "/responses", "/backend-api/codex/responses":
+		return true
+	}
+	return false
 }
 
 func isUpgradeRequest(r *http.Request) bool {

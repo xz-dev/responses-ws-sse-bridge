@@ -24,10 +24,12 @@ for the tested Sub2API passthrough and owner-gate incompatibilities.
 - **Plain HTTP** (any method/path, not a WS upgrade): transparent
   `httputil.ReverseProxy` to `UPSTREAM_URL`. Bodies and headers stream
   untouched (`FlushInterval: -1`); the upstream status is preserved.
-- **WS upgrade on `/v1/responses` or `/responses`**: terminated. Every text
-  frame must be a `response.create` event.
+- **WS upgrade on `/v1/responses`, `/responses` or
+  `/backend-api/codex/responses`**: terminated. Every text frame must be a
+  `response.create` event. A WS upgrade on any other path is tunnelled
+  unchanged.
   - `type: response.create` → `type` stripped, `stream:true` forced, POSTed
-    upstream. Client end-to-end headers (incl. `Authorization`) are forwarded;
+    upstream on the same path. Client end-to-end headers (incl. `Authorization`) are forwarded;
     hop-by-hop and `Sec-WebSocket-*` are dropped.
   - Every upstream SSE event's `data:` payload is relayed as **one text
     frame**, in order.
